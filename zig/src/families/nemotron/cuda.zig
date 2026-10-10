@@ -25,6 +25,10 @@ pub const glue_ref = @import("glue_ref.zig");
 pub const glue_math = @import("glue_math.zig");
 pub const reuse = @import("cuda_reuse.zig");
 pub const slide = @import("cuda_slide.zig");
+/// Checkpoint bytes to the GPU with direct reads in flight: shared with the other CUDA families.
+pub const source = @import("cuda_source.zig");
+/// The torch-op replacements (argmax, topk, casts): shared with the other CUDA families.
+pub const torch_ops = @import("cuda_torch_ops.zig");
 
 test {
     _ = @import("config.zig");

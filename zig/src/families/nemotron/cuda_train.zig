@@ -17,6 +17,7 @@ const lay = @import("cuda_train_layout.zig");
 const prefix = @import("cuda_train_prefix.zig");
 const Count = @import("pocket_clock.zig").Count;
 const Source = @import("cuda_source.zig").Source;
+const Target = @import("cuda_source.zig").Target;
 
 /// Rows a sequence learns from at most: a question and its answer (attention's backward reads at most 256).
 pub const max_rows = 256;
@@ -267,7 +268,7 @@ pub const Trainer = struct {
         var ck = try core.Checkpoint.openModel(t.gpa, io, dir);
         defer ck.close();
         // direct reads through the engine loader's slots: copies from the mapping crawl on GB10
-        var src = try Source.init(t.gpa, t.e.ops());
+        var src = try Source.init(t.gpa, Target.of(t.e.ops()));
         defer src.deinit();
         try src.add(&ck);
         var name: [192]u8 = undefined;

@@ -30,6 +30,11 @@ const kernels = [_]Kernel{
     .{ .name = "exlr8_dense", .flags = &.{ "-O3", "--fmad=false" } }, // ours: EXLR8 dense matrices by row, the Metal order
     .{ .name = "nvfp4_experts", .flags = &.{"-O3"} }, // nvfp4/experts.cu's device code, the NVFP4 expert kernels
     .{ .name = "lane_gemv", .flags = &.{"-O3"} }, // ours: qmm_group's arithmetic, a column tile's K slices in one CTA
+    .{ .name = "exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // cuda/exl3/linear.py, tensorfold_exl3_linear_v3
+    .{ .name = "b16", .flags = &.{"-O3"} }, // families/qwen3_5/cuda/b16.py, unquantized fp16/bf16 projections
+    .{ .name = "q27_rows", .flags = &.{ "-O3", "--fmad=false" } }, // ours: the 27B's row glue (add+RMSNorm, SwiGLU, embed)
+    .{ .name = "q27_prep", .flags = &.{ "-O3", "--fmad=false" } }, // ours: gdn_pre, attn_prep rotary, attn_row
+    .{ .name = "q27_tree", .flags = &.{ "-O3", "--fmad=false" } }, // ours: kernel_attention.py's tree attention, hand-ported
     .{ .name = "sample", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the Metal engine's keyed draws
     .{ .name = "train", .flags = &.{"-O3"} }, // ours: Sliding Weights' learning step (train.metal's kernels)
     .{ .name = "qwen_ops", .flags = &.{"-O3"} }, // ours: the 27B's batched state copies, taps, drafter norms and rotary

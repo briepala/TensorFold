@@ -30,6 +30,11 @@ pub const exlr8: []const u8 = if (available) &Blob("fatbin_exlr8").bytes else &.
 pub const exlr8_dense: []const u8 = if (available) &Blob("fatbin_exlr8_dense").bytes else &.{};
 pub const nvfp4_experts: []const u8 = if (available) &Blob("fatbin_nvfp4_experts").bytes else &.{};
 pub const qwen_ops: []const u8 = if (available) &Blob("fatbin_qwen_ops").bytes else &.{};
+pub const exl3_linear: []const u8 = if (available) &Blob("fatbin_exl3_linear").bytes else &.{};
+pub const b16: []const u8 = if (available) &Blob("fatbin_b16").bytes else &.{};
+pub const q27_rows: []const u8 = if (available) &Blob("fatbin_q27_rows").bytes else &.{};
+pub const q27_prep: []const u8 = if (available) &Blob("fatbin_q27_prep").bytes else &.{};
+pub const q27_tree: []const u8 = if (available) &Blob("fatbin_q27_tree").bytes else &.{};
 pub const sample: []const u8 = if (available) &Blob("fatbin_sample").bytes else &.{};
 pub const train: []const u8 = if (available) &Blob("fatbin_train").bytes else &.{};
 pub const qmmf: []const u8 = if (available) &Blob("fatbin_qmmf").bytes else &.{};
@@ -80,3 +85,38 @@ pub fn treeVariant(slots: u32, streams: u32, major: c_int, minor: c_int, sms: c_
     if (slots <= 16) return tree(16, 2, 2, false);
     return tree(32, 2, 1, false);
 }
+
+/// The exl3_linear image's mangled names (namespace tf_exl3_linear), from cuobjdump of the sm_86 build.
+pub const exl3_symbols = struct {
+    pub const rot_in = "_ZN14tf_exl3_linear13rot_in_kernelEPKviPK6__halfPS2_i";
+    /// linear_kernel<K2, CB, WK>: K2 in {2,3,4,5,6,8,10,12,14,16}, CB 0-2, WK 4 or 8; the template args are in the name.
+    pub const linear_prefix = "_ZN14tf_exl3_linear13linear_kernelI";
+    /// unpack_kernel<K2, CB>: K2 in {2,3,4,5,6,7,8,10,12,14,16}, CB 0-2.
+    pub const unpack_prefix = "_ZN14tf_exl3_linear13unpack_kernelI";
+};
+
+/// The b16 image's mangled names (namespace tf_b16), from cuobjdump of the sm_86 build.
+pub const b16_symbols = struct {
+    pub const bf16_rows_1 = "_ZN6tf_b1610b16_kernelI13__nv_bfloat16Li1ELi4EEEvPKT_S4_S4_PS2_iiiS4_S5_i";
+    pub const bf16_rows_4 = "_ZN6tf_b1610b16_kernelI13__nv_bfloat16Li4ELi8EEEvPKT_S4_S4_PS2_iiiS4_S5_i";
+    pub const bf16_rows_16 = "_ZN6tf_b1610b16_kernelI13__nv_bfloat16Li16ELi16EEEvPKT_S4_S4_PS2_iiiS4_S5_i";
+    pub const bf16_prompt_32 = "_ZN6tf_b1617b16_prompt_kernelILi32EEEvPK13__nv_bfloat16S3_PS1_iiiS3_S4_i";
+    pub const bf16_prompt_64 = "_ZN6tf_b1617b16_prompt_kernelILi64EEEvPK13__nv_bfloat16S3_PS1_iiiS3_S4_i";
+    pub const bf16_prompt_128 = "_ZN6tf_b1617b16_prompt_kernelILi128EEEvPK13__nv_bfloat16S3_PS1_iiiS3_S4_i";
+};
+
+/// The q27 row/prep/tree images' names (namespace tf_q27), from cuobjdump of the sm_86 build.
+pub const q27_symbols = struct {
+    pub const add_rmsnorm = "_ZN6tf_q2711add_rmsnormEPK13__nv_bfloat16S2_S2_PS0_S3_Pffi";
+    pub const gated_norm = "_ZN6tf_q2710gated_normEPK13__nv_bfloat16S2_S2_PS0_Pffii";
+    pub const swiglu = "_ZN6tf_q276swigluEPK13__nv_bfloat16S2_PS0_Pfi";
+    pub const gate_mul = "_ZN6tf_q278gate_mulEPK13__nv_bfloat16S2_PS0_Pfii";
+    pub const b16_embed = "_ZN6tf_q279b16_embedEPKxPK13__nv_bfloat16PS2_i";
+    pub const gdn_pre = "_ZN6tf_q277gdn_preEPK13__nv_bfloat16S2_S2_PKiS2_S2_PKfS2_PS0_S7_S7_PfS8_iiiii";
+    pub const attn_prep = "_ZN6tf_q279attn_prepEPK13__nv_bfloat16S2_S2_S2_PKfS4_PS0_S5_fiiiiiii";
+    pub const attn_row = "_ZN6tf_q278attn_rowEPK13__nv_bfloat16S2_S2_PS0_iiixf";
+    pub const paths = "_ZN6tf_q2712paths_kernelEPKiPiS2_i";
+    pub const shared = "_ZN6tf_q2713shared_kernelEPK13__nv_bfloat16PKyPKiS6_PfS7_S7_iiiiif";
+    pub const tail = "_ZN6tf_q2711tail_kernelEPK13__nv_bfloat16S2_S2_PKyPKiS6_S6_S6_PfS7_S7_iiiiif";
+    pub const merge = "_ZN6tf_q2712merge_kernelEPKfS1_S1_P13__nv_bfloat16PKiS5_iiiii";
+};

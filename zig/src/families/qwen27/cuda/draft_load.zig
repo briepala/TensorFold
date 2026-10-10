@@ -1,4 +1,6 @@
-//! DFlash2's weights as dflash2 holds them: projections quantize4'd and tiled, codebooks fp32 on the host.
+//! DFlash2's drafter the way the Python engine held it on sm_86 (fast=False): projections bf16 on the
+//! GPU behind the b16 row/prompt kernels, codebooks fp32 on the host. Only the head's tail span stays
+//! affine4-tiled, read off the target's quantized lm_head so its rows match the first span's own source.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -76,34 +78,12 @@ fn roundEven(x: f32) f32 {
     const r = @round(x);
     return if (@abs(x - @trunc(x)) == 0.5) 2.0 * @round(x / 2.0) else r;
 }
-
-/// dflash2.quantize4 on the host, bit for bit: (n, k) bf16 to MLX affine 4-bit words, bf16 scales and biases.
-pub fn quantize4(src: []const u8, n: usize, k: usize, words: []u32, scales: []u16, biases: []u16) void {
-    const kg = k / 64;
-    for (0..n) |r| for (0..kg) |gi| {
-        var vals: [64]f32 = undefined;
-        for (&vals, 0..) |*v, j| v.* = bf16Value(std.mem.readInt(u16, src[(r * k + gi * 64 + j) * 2 ..][0..2], .little));
-        var lo = vals[0];
-        var hi = vals[0];
-        for (vals[1..]) |v| {
-            lo = @min(lo, v);
-            hi = @max(hi, v);
-        }
-        const s = toBf16(@max((hi - lo) / 15.0, 1e-8));
-        const b = toBf16(lo);
-        scales[r * kg + gi] = s;
-        biases[r * kg + gi] = b;
-        const sf = bf16Value(s);
-        const bf = bf16Value(b);
-        for (0..8) |wi| {
-            var word: u32 = 0;
-            for (0..8) |j| {
-                const q = std.math.clamp(roundEven((vals[wi * 8 + j] - bf) / sf), 0.0, 15.0);
-                word |= @as(u32, @intFromFloat(q)) << @intCast(4 * j);
-            }
-            words[r * (k / 8) + gi * 8 + wi] = word;
-        }
-    };
+test "toBf16 and roundEven stay torch-exact" {
+    // toBf16/roundEven keep their checks: the tail span still tiles through tile(), and quantize4's
+    // test moved out with it
+    try std.testing.expectEqual(roundEven(2.5), 2.0);
+    try std.testing.expectEqual(roundEven(3.5), 4.0);
+    try std.testing.expectEqual(@as(u16, 0x3FC0), toBf16(1.59375)); // 0x3FFC0000 >> 16 with RNE
 }
 
 const Loader = struct {
@@ -143,15 +123,15 @@ const Loader = struct {
         try L.ops.upload(base, std.mem.sliceAsBytes(words));
         try L.ops.upload(base + sizes[0], std.mem.sliceAsBytes(scales));
         try L.ops.upload(base + sizes[0] + sizes[1], std.mem.sliceAsBytes(biases));
-        const q: QLinear = .{ .w = try L.alloc(npad * k / 2), .s = try L.alloc(kg * npad * 2), .b = try L.alloc(kg * npad * 2), .n = n, .k = k, .npad = npad };
+        const q: QLinear = .{ .affine4 = .{ .w = try L.alloc(npad * k / 2), .s = try L.alloc(kg * npad * 2), .b = try L.alloc(kg * npad * 2), .n = n, .k = k, .npad = npad } };
         const total: u64 = @as(u64, npad / 64) * kg * 512;
         var a: cuda.Args = .{};
         a.add(base);
         for ([_]usize{ n, k8, kg }) |v| a.add(@as(c_int, @intCast(v)));
-        a.add(q.w);
+        a.add(q.affine4.w);
         a.add(@as(c_longlong, @intCast(total)));
         try cuda.launch.launch(L.ops.k.pack_dense, .{ .grid = .{ .x = @intCast((total + 255) / 256) }, .block = .{ .x = 256 } }, L.ops.s, &a);
-        for ([_]u64{ q.s, q.b }, [_]usize{ sizes[0], sizes[0] + sizes[1] }) |out, off| {
+        for ([_]u64{ q.affine4.s, q.affine4.b }, [_]usize{ sizes[0], sizes[0] + sizes[1] }) |out, off| {
             var t: cuda.Args = .{};
             t.add(base + off);
             for ([_]usize{ n, kg, npad }) |v| t.add(@as(c_int, @intCast(v)));
@@ -163,23 +143,24 @@ const Loader = struct {
         return q;
     }
 
-    /// One bf16 (n, k) checkpoint tensor (or several stacked by rows) quantized and tiled.
-    fn quantized(L: *Loader, parts: []const Tensor, k: usize) !QLinear {
+    /// One bf16 (n, k) checkpoint tensor (or several stacked by rows) uploaded as-is: the b16 kernels'
+    /// (n, k) row-major weight, no quantization, ops.dense's .b16 path. K a multiple of 64 for the
+    /// prompt kernel's stages; every part's upload offset a multiple of k*2 bytes (16-byte aligned).
+    fn b16(L: *Loader, parts: []const Tensor, k: usize) !QLinear {
+        if (k % 64 != 0) return error.UnexpectedDraftTensor;
         var n: usize = 0;
         for (parts) |t| {
             if (t.dtype != .bf16 or t.rank != 2 or t.dim(1) != k) return error.UnexpectedDraftTensor;
             n += t.dim(0);
         }
-        try L.words.resize(L.gpa, n * k / 8);
-        try L.scales.resize(L.gpa, n * k / 64);
-        try L.biases.resize(L.gpa, n * k / 64);
+        const w = try L.alloc(n * k * 2);
         var row: usize = 0;
         for (parts) |t| {
-            const r = t.dim(0);
-            quantize4(t.bytes, r, k, L.words.items[row * k / 8 ..][0 .. r * k / 8], L.scales.items[row * k / 64 ..][0 .. r * k / 64], L.biases.items[row * k / 64 ..][0 .. r * k / 64]);
-            row += r;
+            try L.ops.upload(w + row * k * 2, t.bytes);
+            row += t.dim(0);
         }
-        return L.tile(L.words.items, L.scales.items, L.biases.items, n, k);
+        try L.ops.s.synchronize(); // the mapped shards unmap when load returns
+        return .{ .b16 = .{ .w = w, .n = n, .k = k } };
     }
 
     fn get(ck: *core.Checkpoint, comptime fmt: []const u8, args: anytype) !Tensor {
@@ -198,6 +179,7 @@ const Loader = struct {
 
 /// The drafter at `dir`, and the target head's last span tiled from the target checkpoint at `target_dir`.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, target_dir: []const u8) !Weights {
+    if (!ops.k.b16_on) return error.B16KernelsUnavailable; // every drafter projection runs on the b16 image
     var w: Weights = .{ .gpa = gpa };
     errdefer w.deinit();
     var L: Loader = .{ .gpa = gpa, .ops = ops, .w = &w };
@@ -213,27 +195,27 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
         const q = try Loader.get(&ck, "layers.{d}.self_attn.q_proj.weight", .{i});
         const k = try Loader.get(&ck, "layers.{d}.self_attn.k_proj.weight", .{i});
         const v = try Loader.get(&ck, "layers.{d}.self_attn.v_proj.weight", .{i});
-        l.qkv = try L.quantized(&.{ q, k, v }, hidden);
-        l.kv = try L.quantized(&.{ k, v }, hidden);
-        l.o = try L.quantized(&.{try Loader.get(&ck, "layers.{d}.self_attn.o_proj.weight", .{i})}, heads * head_dim);
+        l.qkv = try L.b16(&.{ q, k, v }, hidden);
+        l.kv = try L.b16(&.{ k, v }, hidden);
+        l.o = try L.b16(&.{try Loader.get(&ck, "layers.{d}.self_attn.o_proj.weight", .{i})}, heads * head_dim);
         l.q_norm = try L.raw(try Loader.get(&ck, "layers.{d}.self_attn.q_norm.weight", .{i}));
         l.k_norm = try L.raw(try Loader.get(&ck, "layers.{d}.self_attn.k_norm.weight", .{i}));
         l.in_norm = try L.raw(try Loader.get(&ck, "layers.{d}.input_layernorm.weight", .{i}));
         l.post_norm = try L.raw(try Loader.get(&ck, "layers.{d}.post_attention_layernorm.weight", .{i}));
-        l.attn_proj = try L.quantized(&.{try Loader.get(&ck, "layers.{d}.attention_conv.kernel_projection.weight", .{i})}, hidden);
+        l.attn_proj = try L.b16(&.{try Loader.get(&ck, "layers.{d}.attention_conv.kernel_projection.weight", .{i})}, hidden);
         l.attn_base = try L.raw(try Loader.get(&ck, "layers.{d}.attention_conv.base_kernel", .{i}));
-        l.mlp_proj = try L.quantized(&.{try Loader.get(&ck, "layers.{d}.mlp_conv.kernel_projection.weight", .{i})}, hidden);
+        l.mlp_proj = try L.b16(&.{try Loader.get(&ck, "layers.{d}.mlp_conv.kernel_projection.weight", .{i})}, hidden);
         l.mlp_base = try L.raw(try Loader.get(&ck, "layers.{d}.mlp_conv.base_kernel", .{i}));
-        l.gate = try L.quantized(&.{try Loader.get(&ck, "layers.{d}.mlp.gate_proj.weight", .{i})}, hidden);
-        l.up = try L.quantized(&.{try Loader.get(&ck, "layers.{d}.mlp.up_proj.weight", .{i})}, hidden);
+        l.gate = try L.b16(&.{try Loader.get(&ck, "layers.{d}.mlp.gate_proj.weight", .{i})}, hidden);
+        l.up = try L.b16(&.{try Loader.get(&ck, "layers.{d}.mlp.up_proj.weight", .{i})}, hidden);
         const down = try Loader.get(&ck, "layers.{d}.mlp.down_proj.weight", .{i});
-        l.down = try L.quantized(&.{down}, down.dim(1));
+        l.down = try L.b16(&.{down}, down.dim(1));
     }
     const fc = try ck.get("fc.weight");
-    w.fc = try L.quantized(&.{fc}, fc.dim(1));
+    w.fc = try L.b16(&.{fc}, fc.dim(1));
     w.hidden_norm = try L.raw(try ck.get("hidden_norm.weight"));
     w.norm = try L.raw(try ck.get("norm.weight"));
-    w.select = try L.quantized(&.{try ck.get("candidate_selector.hidden_projection.weight")}, hidden);
+    w.select = try L.b16(&.{try ck.get("candidate_selector.hidden_projection.weight")}, hidden);
     w.pred = try L.codebook(try ck.get("candidate_selector.predecessor_codebook"));
     w.succ = try L.codebook(try ck.get("candidate_selector.successor_codebook"));
     if (ck.unused() != 0) return error.UnusedDraftTensors;

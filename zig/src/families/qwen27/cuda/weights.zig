@@ -12,8 +12,8 @@ pub const QLinear = kern.QLinear;
 const Tensor = core.checkpoint.Tensor;
 const prefix = "language_model.";
 
-/// The token table as stored (MLX words, scales, biases): a row lookup, not a matmul.
-pub const Embed = struct { w: u64, s: u64, b: u64 };
+/// The token table as stored: MLX words+scales+biases, or one bf16 table (an EXL3 pack).
+pub const Embed = union(enum) { mlx: struct { w: u64, s: u64, b: u64 }, b16: struct { w: u64, d: usize } };
 pub const Delta = struct { qkv: QLinear, z: QLinear, b: QLinear, a: QLinear, out: QLinear, conv: u64, a_log: u64, dt_bias: u64, norm: u64 };
 pub const Attention = struct { q: QLinear, k: QLinear, v: QLinear, o: QLinear, q_norm: u64, k_norm: u64 };
 pub const Mixer = union(enum) { delta: Delta, attention: Attention };
@@ -30,10 +30,12 @@ pub const Weights = struct {
     eos: [config_eos]u32 = undefined, // config.json's end tokens, then generation_config.json's
     eos_count: usize = 0,
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
+    scales_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator), // EXL3 sign expansion
 
     pub fn deinit(w: *Weights) void {
         for (w.buffers.items) |*b| b.free();
         w.buffers.deinit(w.gpa);
+        w.scales_arena.deinit();
         w.gpa.free(w.layers);
         w.* = undefined;
     }
@@ -120,16 +122,16 @@ const Loader = struct {
         const base = try L.tmp(sizes[0] + sizes[1] + sizes[2]);
         const at = [3]usize{ 0, sizes[0], sizes[0] + sizes[1] };
         for (0..3) |j| try L.src.upload(base + at[j], parts[j].bytes);
-        const q: QLinear = .{ .w = try L.alloc(npad * k / 2), .s = try L.alloc(kg * npad * 2), .b = try L.alloc(kg * npad * 2), .n = n, .k = k, .npad = npad };
+        const q: QLinear = .{ .affine4 = .{ .w = try L.alloc(npad * k / 2), .s = try L.alloc(kg * npad * 2), .b = try L.alloc(kg * npad * 2), .n = n, .k = k, .npad = npad } };
         const total: u64 = @as(u64, npad / 64) * kg * 512;
         try L.src.flush();
         var a: cuda.Args = .{};
         a.add(base);
         for ([_]usize{ n, k8, kg }) |v| a.add(@as(c_int, @intCast(v)));
-        a.add(q.w);
+        a.add(q.affine4.w);
         a.add(@as(c_longlong, @intCast(total)));
         try cuda.launch.launch(L.ops.k.pack_dense, .{ .grid = .{ .x = @intCast((total + 255) / 256) }, .block = .{ .x = 256 } }, L.ops.s, &a);
-        for ([_]u64{ q.s, q.b }, [_]usize{ at[1], at[2] }) |out, off| {
+        for ([_]u64{ q.affine4.s, q.affine4.b }, [_]usize{ at[1], at[2] }) |out, off| {
             var t: cuda.Args = .{};
             t.add(base + off);
             for ([_]usize{ n, kg, npad }) |v| t.add(@as(c_int, @intCast(v)));
@@ -185,6 +187,15 @@ const Loader = struct {
     }
 };
 
+/// quantization_config.json's quant_method, when the folder holds one.
+fn isExl3(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) bool {
+    const path = std.fs.path.join(gpa, &.{ dir, "quantization_config.json" }) catch return false;
+    defer gpa.free(path);
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch return false;
+    defer gpa.free(text);
+    return std.mem.indexOf(u8, text, "\"quant_method\"") != null and std.mem.indexOf(u8, text, "\"exl3\"") != null;
+}
+
 /// weights.inv_freq: theta ** (-i / half) in float64, rounded to fp32.
 pub fn invFreq(out: []f32) void {
     const half: f64 = @floatFromInt(out.len);
@@ -193,6 +204,11 @@ pub fn invFreq(out: []f32) void {
 
 /// weights.load (tiled, one GPU): the model folder's text tensors on the GPU, leftovers refused.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, cfg: c.Config) !Weights {
+    // an EXL3 pack carries quantization_config.json with quant_method "exl3": its own loader
+    if (isExl3(gpa, io, dir)) {
+        if (!ops.k.exl3_on) return error.Exl3KernelsUnavailable;
+        return @import("exl3_weights.zig").load(gpa, io, ops, &ops.k.exl3, dir, cfg);
+    }
     const g = cfg.g;
     var w: Weights = .{ .gpa = gpa, .g = g, .eos = cfg.eos, .eos_count = cfg.eos_count };
     errdefer w.deinit();
@@ -226,11 +242,11 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
         layer.down = try L.tile(&ck, try join(&nb, p, "mlp.down_proj"), g.hidden, g.intermediate);
         layer.post_norm = try L.vector(&ck, try join(&nb, p, "post_attention_layernorm.weight"), g.hidden);
     }
-    w.embed = .{
+    w.embed = .{ .mlx = .{
         .w = try L.raw(try ck.expect(prefix ++ "model.embed_tokens.weight", .u32, &.{ c.vocab, g.hidden / 8 })),
         .s = try L.raw(try ck.expect(prefix ++ "model.embed_tokens.scales", .bf16, &.{ c.vocab, g.hidden / 64 })),
         .b = try L.raw(try ck.expect(prefix ++ "model.embed_tokens.biases", .bf16, &.{ c.vocab, g.hidden / 64 })),
-    };
+    } };
     w.norm = try L.vector(&ck, "model.norm.weight", g.hidden);
     w.head = try L.tile(&ck, "lm_head", c.vocab, g.hidden);
     if (ck.unused() != 0) return error.UnusedCheckpointTensors;

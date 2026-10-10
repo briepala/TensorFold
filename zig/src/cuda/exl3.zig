@@ -9,12 +9,18 @@ const launch = @import("launch.zig");
 const kernels = @import("kernels.zig");
 const format = @import("exl3_scan.zig");
 pub const Codebook = format.Codebook;
+pub const Entry = format.Entry;
+pub const View = format.View;
+pub const DType = format.DType;
 pub const Width = format.Width;
 pub const Group = format.Group;
 pub const scan = format.scan;
 
 /// (K splits, warps a program) for a K x N layer: linear.py's plan, the shape's alone.
-pub fn plan(k: usize, n: usize, blocks: usize, min_tiles: usize) struct { sk: u32, wk: u32 } {
+/// The launch plan a weight's shape fixes: K splits and warps a program.
+pub const Plan = struct { sk: u32, wk: u32 };
+
+pub fn plan(k: usize, n: usize, blocks: usize, min_tiles: usize) Plan {
     const kt = k / 16;
     const nb = n / 128;
     var sk: u32 = 1;
@@ -137,30 +143,40 @@ pub const Linear = struct {
     d: *const Driver,
     mod: Module,
     rot_in: @import("module.zig").Function,
-    unpack: @import("module.zig").Function,
     lin: [lin_syms.len]@import("module.zig").Function,
+    unp: [unp_syms.len]@import("module.zig").Function,
     counters: memory.DeviceBuffer,
+    own_mod: ?Module = null, // set by load(); fromModule callers keep their module
 
     pub fn load(d: *const Driver) !Linear {
         if (!kernels.available) return error.NoKernels;
-        var mod = try Module.load(d, kernels.exl3_linear);
-        errdefer mod.unload();
+        const mod = try Module.load(d, kernels.exl3_linear);
+        var out = try Linear.fromModule(d, &mod);
+        out.own_mod = mod;
+        return out;
+    }
+
+    /// The same resolution over a module the caller loaded (and owns unloading of).
+    /// The caller owns `mod`'s lifetime: this Linear resolves functions from it and never unloads it.
+    pub fn fromModule(d: *const Driver, mod: *const Module) !Linear {
         var out: Linear = undefined;
         out.d = d;
         out.rot_in = try mod.function(kernels.exl3_symbols.rot_in);
-        out.unpack = try mod.function(kernels.exl3_symbols.unpack);
         const counter_bytes = 8 * 1024;
         out.counters = try memory.DeviceBuffer.alloc(d, counter_bytes);
         errdefer out.counters.free();
         out.counters.fill32(0, null) catch {};
         inline for (lin_syms, 0..) |s, i| out.lin[i] = try mod.function(s.name);
+        inline for (unp_syms, 0..) |s, i| out.unp[i] = try mod.function(s.name);
         return out;
     }
 
     pub fn deinit(l: *Linear) void {
         l.counters.free();
-        l.mod.unload();
+        if (l.own_mod) |*m| m.unload();
     }
+
+
 
     /// xh [M, K] fp16 = (x * suh) rotated by H / sqrt(128): rot_in_kernel, one block a 4-block span and row.
     pub fn rotIn(l: *const Linear, s: stream_.Stream, x: memory.DeviceBuffer, suh: memory.DeviceBuffer, xh: memory.DeviceBuffer, m: usize, k: usize) !void {
@@ -211,6 +227,67 @@ pub const Linear = struct {
         }, s, &args);
     }
 
+    /// rotIn over raw device pointers: x (rows, k) bf16 -> xh fp16, scaled and rotated.
+    pub fn rotInPtr(l: *const Linear, s: stream_.Stream, x: u64, suh: u64, xh: u64, m: usize, k: usize) !void {
+        const blocks = (k / 128 + 3) / 4;
+        var args = launch.Args{};
+        args.add(x);
+        args.add(@as(c_int, 1)); // BF16 inputs
+        args.add(suh);
+        args.add(xh);
+        args.add(@as(c_int, @intCast(k)));
+        try launch.launch(l.rot_in, .{ .grid = .{ .x = @intCast(blocks), .y = @intCast(m), .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &args);
+    }
+
+    /// matmul over raw pointers, with the split-K partials buffer when the plan splits.
+    pub fn matmulPtr(l: *const Linear, s: stream_.Stream, w: Weight, xh: u64, y: u64, z: u64, m: usize) !void {
+        const p = w.split();
+        const f = try l.function(p.wk, w.codebook, w.width.halves);
+        const shared: u32 = @intCast(p.wk * @min(m, 8) * 128 * 4);
+        if (shared > 48 * 1024) try f.allowDynamicShared(shared);
+        var args = launch.Args{};
+        args.add(xh);
+        args.add(w.trellis.ptr);
+        args.add(@as(i64, @intCast(w.strideK())));
+        args.add(@as(i64, @intCast(w.strideN())));
+        args.add(w.svh.ptr);
+        args.add(w.bias.ptr);
+        args.add(y);
+        args.add(@as(c_int, 1)); // y bf16
+        args.add(z); // 0 when unsplit
+        args.add(l.counters.ptr);
+        args.add(@as(c_int, @intCast(m)));
+        args.add(@as(c_int, @intCast(w.k)));
+        args.add(@as(c_int, @intCast(w.n)));
+        args.add(@as(c_int, @intCast(p.sk)));
+        const grid_x: u32 = @intCast(w.n / 128);
+        try launch.launch(f, .{
+            .grid = .{ .x = grid_x, .y = @intCast(p.sk), .z = 1 },
+            .block = .{ .x = @intCast(p.wk * 32), .y = 1, .z = 1 },
+            .shared = shared,
+        }, s, &args);
+    }
+
+    /// W_q [k, n] fp16 unpacked from the trellis, once a prompt chunk.
+    pub fn unpackPtr(l: *const Linear, s: stream_.Stream, w: Weight, out: u64) !void {
+        const f = try l.unpackFn(w.width.halves, w.codebook);
+        var args = launch.Args{};
+        args.add(w.trellis.ptr);
+        args.add(out);
+        args.add(@as(i64, @intCast(w.strideK())));
+        args.add(@as(i64, @intCast(w.strideN())));
+        args.add(@as(c_int, @intCast(w.width.halves)));
+        args.add(@as(c_int, @intFromEnum(w.codebook)));
+        try launch.launch(f, .{ .grid = .{ .x = @intCast((w.k / 16 + 3) / 4), .y = @intCast(w.n / 128), .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &args);
+    }
+
+    fn unpackFn(l: *const Linear, halves: u16, cb: Codebook) !@import("module.zig").Function {
+        for (unp_syms, 0..) |sym, i| {
+            if (sym.k2 == halves and sym.cb == @intFromEnum(cb)) return l.unp[i];
+        }
+        return error.UnsupportedWidth;
+    }
+
     fn function(l: *const Linear, wk: u32, cb: Codebook, halves: u16) !@import("module.zig").Function {
         const k2: u16 = halves;
         for (lin_syms, 0..) |sym, i| {
@@ -240,7 +317,7 @@ pub const Weight = struct {
         return 8 * w.width.tileWords();
     }
 
-    pub fn split(w: Weight) struct { sk: u32, wk: u32 } {
+    pub fn split(w: Weight) Plan {
         return plan(w.k, w.n, 192, 8);
     }
 };
@@ -248,12 +325,12 @@ pub const Weight = struct {
 /// Upload one group as stored (no reorder): trellis, scales (packed signs expanded on the host), optional bias.
 pub fn upload(d: *const Driver, a: std.mem.Allocator, g: Group) !Weight {
     if (g.k % 128 != 0 or g.n % 128 != 0) return error.NotMultipleOf128;
-    const trellis = try memory.DeviceBuffer.alloc(d, g.trellis.bytes.len);
+    var trellis = try memory.DeviceBuffer.alloc(d, g.trellis.bytes.len);
     errdefer trellis.free();
     try trellis.upload(0, g.trellis.bytes);
-    const suh = try uploadScale(d, a, g.suh, g.k);
+    var suh = try uploadScale(d, a, g.suh, g.k);
     errdefer suh.free();
-    const svh = try uploadScale(d, a, g.svh, g.n);
+    var svh = try uploadScale(d, a, g.svh, g.n);
     errdefer svh.free();
     var bias = memory.DeviceBuffer{ .d = d, .ptr = 0, .len = 0 };
     if (g.bias) |b| {
@@ -267,17 +344,17 @@ pub fn upload(d: *const Driver, a: std.mem.Allocator, g: Group) !Weight {
 fn uploadScale(d: *const Driver, a: std.mem.Allocator, t: format.Entry, size: usize) !memory.DeviceBuffer {
     if (t.dtype == .f16) {
         if (t.bytes.len != size * 2) return error.BadScale;
-        const out = try memory.DeviceBuffer.alloc(d, t.bytes.len);
+        var out = try memory.DeviceBuffer.alloc(d, t.bytes.len);
         errdefer out.free();
         try out.upload(0, t.bytes);
         return out;
     }
     if (t.dtype == .i16 and t.bytes.len * 8 == size * 2) {
-        const words = std.mem.bytesAsSlice(i16, t.bytes);
+        const words: []align(1) const i16 = @as([*]align(1) const i16, @ptrCast(t.bytes.ptr))[0..t.bytes.len / 2];
         const f16s = try a.alloc(f16, size);
         defer a.free(f16s);
         format.unpackSigns(words, f16s);
-        const out = try memory.DeviceBuffer.alloc(d, size * 2);
+        var out = try memory.DeviceBuffer.alloc(d, size * 2);
         errdefer out.free();
         try out.upload(0, std.mem.sliceAsBytes(f16s));
         return out;

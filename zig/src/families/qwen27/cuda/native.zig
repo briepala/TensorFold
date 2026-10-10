@@ -10,7 +10,8 @@ const Lanes = @import("lanes.zig").Cuda;
 const dr = @import("draft.zig");
 
 pub const model_type = "qwen3_5";
-pub const formats: []const []const u8 = &.{"mlx-q4g64"};
+/// "exl3" serves the same shapes from a trellis pack: the FP8-free kernels any sm_86+ GPU runs.
+pub const formats: []const []const u8 = &.{ "mlx-q4g64", "exl3" };
 pub const default_context: i64 = 32768;
 pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = engine.prompt_rows;

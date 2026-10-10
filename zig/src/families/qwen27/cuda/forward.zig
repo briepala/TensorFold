@@ -1,6 +1,7 @@
 //! The 27B's forward on CUDA: verify rounds (tree_forward, multi_tree_forward), their commit, and prompt chunks.
 
 const std = @import("std");
+const cuda = @import("cuda");
 const c = @import("shape.zig");
 const kern = @import("kernels.zig");
 const tri = @import("triton.zig");
@@ -46,6 +47,22 @@ pub const Forward = struct {
         try f.ops.s.synchronize(); // the host copy must outlive the async upload
     }
 
+    /// The embedding lookup by table format: MLX's captured Triton row dequant, or the bf16 rows copy.
+    fn embed(f: *Forward, e: wts.Embed, ids: u64, out: u64, rows: usize) !void {
+        switch (e) {
+            .mlx => |m| try f.t.embed(ids, m.w, m.s, m.b, out, rows, f.g().hidden),
+            .b16 => |b| {
+                var a: cuda.Args = .{};
+                a.add(ids);
+                a.add(b.w);
+                a.add(out);
+                a.add(@as(c_int, @intCast(b.d)));
+                a.add(@as(c_int, @intCast(rows)));
+                try cuda.launch.launch(f.ops.k.b16_embed, .{ .grid = .{ .x = @intCast((rows + 255) / 256), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, f.ops.s, &a);
+            },
+        }
+    }
+
     /// add_rmsnorm into the scratch's other residual buffer; returns the residual stream's new home.
     fn norm(f: *Forward, x: u64, r: ?u64, weight: u64, rows: usize) !u64 {
         const out = if (r == null) x else if (x == f.s.x) f.s.h else f.s.x;
@@ -87,7 +104,7 @@ pub const Forward = struct {
         const w = f.w;
         const r = try rnd.stage(f.gpa, f.ops, f.t, s, g_, parts);
         const W = r.rows;
-        try f.t.embed(r.ids, w.embed.w, w.embed.s, w.embed.b, s.x, W, g_.hidden);
+        try f.embed(w.embed, r.ids, s.x, W);
         var x = s.x;
         var pending: ?u64 = null;
         var lin: usize = 0;
@@ -232,7 +249,7 @@ pub const Forward = struct {
             try f.upload32(s.pos, host[W .. 2 * W]);
             try f.upload32(s.windows, host[2 * W ..]);
         }
-        try f.t.embed(s.ids, w.embed.w, w.embed.s, w.embed.b, s.x, W, g_.hidden);
+        try f.embed(w.embed, s.ids, s.x, W);
         var x = s.x;
         var pending: ?u64 = null;
         const kv = g_.kvInner() * bf;
@@ -366,7 +383,7 @@ pub const Forward = struct {
         try f.ops.upload(s.copy_items, std.mem.sliceAsBytes(items.items));
         try f.ops.copies(s.copy_items, staged);
         const item = @sizeOf(kern.Copy);
-        try f.t.embed(s.ids, w.embed.w, w.embed.s, w.embed.b, s.x, W, g_.hidden);
+        try f.embed(w.embed, s.ids, s.x, W);
         var x = s.x;
         var pending: ?u64 = null;
         lin_n = 0;

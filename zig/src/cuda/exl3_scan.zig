@@ -126,7 +126,7 @@ fn optionalTensor(v: View, name: []const u8) ?Entry {
 }
 
 /// The packed sign words of an older checkpoint expanded to fp16 signs (format.py's unpack_signs).
-pub fn unpackSigns(packed_words: []const i16, out: []f16) void {
+pub fn unpackSigns(packed_words: []align(1) const i16, out: []f16) void {
     for (packed_words, 0..) |word, i| {
         const w: u16 = @bitCast(word);
         const bits = @as(u16, 1) << 15;

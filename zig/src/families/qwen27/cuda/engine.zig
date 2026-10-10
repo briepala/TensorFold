@@ -26,6 +26,7 @@ pub const Engine = struct {
     ctx: *const cuda.Context,
     s: cuda.Stream,
     k: kern.Kernels,
+    trellis: kern.Trellis = undefined,
     w: wts.Weights,
     scratch: st.Scratch,
     context: usize,
@@ -42,6 +43,10 @@ pub const Engine = struct {
         errdefer e.s.deinit();
         e.k = try kern.Kernels.load(gpa, io, ctx, kernels, g.linear_v_heads);
         errdefer e.k.deinit();
+        if (e.k.exl3_on) {
+            e.trellis = kern.Trellis.init(ctx.d);
+            errdefer e.trellis.deinit();
+        }
         e.w = try wts.load(gpa, io, e.ops(), dir, cfg);
         errdefer e.w.deinit();
         e.scratch = try st.Scratch.init(gpa, ctx.d, g, prompt_rows, o.context);
@@ -51,6 +56,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(e: *Engine) void {
+        if (e.k.exl3_on) e.trellis.deinit();
         e.scratch.deinit();
         e.w.deinit();
         e.k.deinit();
@@ -59,7 +65,7 @@ pub const Engine = struct {
     }
 
     pub fn ops(e: *Engine) kern.Ops {
-        return .{ .k = &e.k, .s = e.s };
+        return .{ .k = &e.k, .s = e.s, .trellis = if (e.k.exl3_on) &e.trellis else null };
     }
 
     pub fn forward(e: *Engine) Forward {

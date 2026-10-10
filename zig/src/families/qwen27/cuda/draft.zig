@@ -196,8 +196,14 @@ pub const DFlash2 = struct {
 
     /// _lin: a packed projection of `rows` rows (each row's bits its own at any count), group sums first.
     fn lin(x: *DFlash2, in: u64, q: kern.QLinear, out: u64, rows: usize) !void {
-        try x.t.groupSums(in, x.xs, q.k, rows, q.k);
-        try x.ops.dense(in, x.xs, q, out, rows);
+        switch (q) {
+            .affine4 => |a| {
+                try x.t.groupSums(in, x.xs, a.k, rows, a.k);
+                try x.ops.dense(in, x.xs, q, out, rows);
+            },
+            .b16 => try x.ops.dense(in, 0, q, out, rows), // bf16 rows need no group sums
+            .exl3 => try x.ops.dense(in, 0, q, out, rows),
+        }
     }
 
     /// F.rms_norm over `rows` contiguous rows of the hidden width (the layers' and the head's norms).
@@ -341,7 +347,18 @@ pub const DFlash2 = struct {
         try x.ops.upload(x.ids, std.mem.sliceAsBytes(ids[0..rows]));
         try x.ops.upload(x.table, table[0 .. dl.layers * per]);
         const tw = x.target;
-        try x.t.embed(x.ids, tw.embed.w, tw.embed.s, tw.embed.b, x.x, rows, H);
+        switch (tw.embed) {
+            .mlx => |m| try x.t.embed(x.ids, m.w, m.s, m.b, x.x, rows, H),
+            .b16 => |b| {
+                var a: cuda.Args = .{};
+                a.add(x.ids);
+                a.add(b.w);
+                a.add(x.x);
+                a.add(@as(c_int, @intCast(b.d)));
+                a.add(@as(c_int, @intCast(rows)));
+                try cuda.launch.launch(x.ops.k.b16_embed, .{ .grid = .{ .x = @intCast((rows + 255) / 256), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, x.ops.s, &a);
+            },
+        }
         try x.rotary(runs[0..S]);
         const scale: f32 = @floatCast(std.math.pow(f64, D, -0.5));
         for (x.w.layers, 0..) |l, i| {
@@ -364,7 +381,7 @@ pub const DFlash2 = struct {
             try x.t.groupSums(x.conv, x.xs, H, rows, H);
             try x.ops.dense(x.conv, x.xs, l.gate, x.gate, rows);
             try x.ops.dense(x.conv, x.xs, l.up, x.up, rows);
-            try x.t.swiglu(x.gate, x.up, x.act, x.act_xs, rows, l.gate.n);
+            try x.t.swiglu(x.gate, x.up, x.act, x.act_xs, rows, l.gate.n());
             try x.ops.dense(x.act, x.act_xs, l.down, x.o, rows);
             try x.dconv(x.o, x.dyn, l.mlp_base, 1, x.x, x.x, rows, L);
         }
@@ -376,7 +393,12 @@ pub const DFlash2 = struct {
         // matmul_rows: the head's spans at the stacked rows' K split (1), then joined column-wise
         try x.t.groupSums(x.head_h, x.xs, H, total, H);
         const head = tw.head;
-        const first: kern.QLinear = .{ .w = head.w, .s = head.s, .b = head.b, .n = dl.spans[0][1], .k = head.k, .npad = head.npad };
+        // the head's first span: the same weight with n cut to the span (affine4's row views make this free)
+        const first: kern.QLinear = switch (head) {
+            .affine4 => |a| .{ .affine4 = .{ .w = a.w, .s = a.s, .b = a.b, .n = dl.spans[0][1], .k = a.k, .npad = a.npad } },
+            .exl3 => |e| .{ .exl3 = e },   // the trellis head serves both spans by column block in one launch
+            .b16 => |b| .{ .b16 = b },
+        };
         try x.ops.denseSplit(x.head_h, x.xs, first, x.logits32, total, 1); // a scratch of the right size
         try x.ops.denseSplit(x.head_h, x.xs, x.w.head_tail, x.logits_tail, total, 1);
         var items: std.ArrayList(kern.Copy) = .empty;

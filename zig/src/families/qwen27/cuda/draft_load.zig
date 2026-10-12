@@ -6,7 +6,6 @@ const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");
 const kern = @import("kernels.zig");
-const st = @import("state.zig");
 
 pub const QLinear = kern.QLinear;
 const Tensor = core.checkpoint.Tensor;
@@ -68,29 +67,11 @@ fn bf16Value(word: u16) f32 {
     return @bitCast(@as(u32, word) << 16);
 }
 
-fn toBf16(x: f32) u16 {
-    const b: u32 = @bitCast(x);
-    return @intCast((b + 0x7FFF + ((b >> 16) & 1)) >> 16);
-}
-
-/// torch.round: halves to even.
-fn roundEven(x: f32) f32 {
-    const r = @round(x);
-    return if (@abs(x - @trunc(x)) == 0.5) 2.0 * @round(x / 2.0) else r;
-}
-test "toBf16 and roundEven stay torch-exact" {
-    // toBf16/roundEven keep their checks: the tail span still tiles through tile(), and quantize4's
-    // test moved out with it
-    try std.testing.expectEqual(roundEven(2.5), 2.0);
-    try std.testing.expectEqual(roundEven(3.5), 4.0);
-    try std.testing.expectEqual(@as(u16, 0x3FC0), toBf16(1.59375)); // 0x3FFC0000 >> 16 with RNE
-}
-
 const Loader = struct {
     gpa: std.mem.Allocator,
     ops: kern.Ops,
     w: *Weights,
-    words: std.ArrayList(u32) = .empty,
+    words: std.ArrayList(u32) = .empty, // the head tail's host staging: the target ships it pre-quantized
     scales: std.ArrayList(u16) = .empty,
     biases: std.ArrayList(u16) = .empty,
     staging: ?cuda.DeviceBuffer = null,
@@ -240,17 +221,3 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
     return w;
 }
 
-test "quantize4 rounds as torch does" {
-    // one group: values 0..63 / 4 -> lo 0, scale bf16(63/4/15 = 1.05), each q round-half-even of v / 1.046875
-    var src: [64 * 2]u8 = undefined;
-    for (0..64) |j| std.mem.writeInt(u16, src[2 * j ..][0..2], toBf16(@as(f32, @floatFromInt(j)) / 4.0), .little);
-    var words: [8]u32 = undefined;
-    var scales: [1]u16 = undefined;
-    var biases: [1]u16 = undefined;
-    quantize4(&src, 1, 64, &words, &scales, &biases);
-    try std.testing.expectEqual(toBf16(63.0 / 4.0 / 15.0), scales[0]);
-    try std.testing.expectEqual(@as(u16, 0), biases[0]);
-    try std.testing.expectEqual(@as(u32, 15), words[7] >> 28);
-    try std.testing.expectEqual(roundEven(2.5), 2.0);
-    try std.testing.expectEqual(roundEven(3.5), 4.0);
-}

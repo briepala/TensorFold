@@ -1,6 +1,7 @@
 //! Row glue of the Qwen3.8-27B decode path: add+RMSNorm, gated norm, SwiGLU and embedding rows.
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -97,13 +98,19 @@ __global__ void __launch_bounds__(32) gate_mul(const bf16* __restrict__ o, const
     group_sums(out + dst, xs + (size_t)row * (heads * d / 64) + head * (d / 64), d / 64);
 }
 
-// A bf16 embedding row gather: out = table[id] as stored (the EXL3 pack's plain table).
-__global__ void __launch_bounds__(32) b16_embed(const long long* __restrict__ ids, const bf16* __restrict__ table,
+// A bf16 embedding row gather: out = table[id] as stored (the EXL3 pack's plain table); ids are the engine's int32 rows.
+__global__ void __launch_bounds__(32) b16_embed(const int* __restrict__ ids, const bf16* __restrict__ table,
                                                 bf16* __restrict__ out, int d) {
     const int row = blockIdx.x, lane = threadIdx.x;
     const bf16* src = table + (size_t)ids[row] * d;
     bf16* dst = out + (size_t)row * d;
     for (int i = lane * 8; i < d; i += 256) *reinterpret_cast<uint4*>(dst + i) = *reinterpret_cast<const uint4*>(src + i);
+}
+
+// bf16 values to fp16 as torch's .to(float16) rounds them (through fp32, to nearest even): an fp16 weight's inputs.
+__global__ void __launch_bounds__(256) bf16_to_f16(const bf16* __restrict__ x, __half* __restrict__ y, long long n) {
+    for (long long i = blockIdx.x * 256LL + threadIdx.x; i < n; i += (long long)gridDim.x * 256)
+        y[i] = __float2half_rn(__bfloat162float(x[i]));
 }
 
 }  // namespace tf_q27

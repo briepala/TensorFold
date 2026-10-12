@@ -40,17 +40,9 @@ fn entryOf(t: Tensor) !exl3.Entry {
         .i16 => .i16,
         else => .other,
     };
-    var e: exl3.Entry = .{ .dtype = dt, .shape = .{ 1, 1, 1 }, .rank = 1, .bytes = t.bytes };
-    switch (t.shape.len) {
-        1 => e.shape[0] = t.shape[0],
-        2 => {
-            e.shape[0] = t.shape[1];
-            e.shape[1] = t.shape[0];
-        },
-        3 => e.shape = .{ t.shape[2], t.shape[1], t.shape[0] },
-        else => return error.BadTrellisShape,
-    }
-    e.rank = t.shape.len;
+    if (t.rank > 3) return error.BadTrellisShape;
+    var e: exl3.Entry = .{ .dtype = dt, .shape = .{ 1, 1, 1 }, .rank = t.rank, .bytes = t.bytes };
+    for (t.shape[0..t.rank], 0..) |d, i| e.shape[i] = d; // as stored: the trellis is [K/16, N/16, words]
     return e;
 }
 
@@ -98,6 +90,29 @@ const Loader = struct {
         return L.raw(try ck.expect(name, .bf16, &.{len}));
     }
 
+    /// exl3_load.norm: a centred RMSNorm weight (stored gamma - 1) with its 1 back, (w.float() + 1.0).to(bf16).
+    fn centred(L: *Loader, ck: *core.Checkpoint, name: []const u8, len: usize) !u64 {
+        const t = try ck.expect(name, .bf16, &.{len});
+        const out = std.mem.bytesAsSlice(u16, try L.staging(len * 2));
+        const in = try L.src.view(t.bytes);
+        for (out, 0..) |*o, i| {
+            const w: f32 = @bitCast(@as(u32, std.mem.readInt(u16, in[2 * i ..][0..2], .little)) << 16);
+            o.* = core.affine4_host.bf16of(w + 1.0);
+        }
+        const ptr = try L.alloc(len * 2);
+        try L.ops.upload(ptr, L.host.items);
+        return ptr;
+    }
+
+    /// An unquantized bf16 projection: (n, k) as stored, uploaded raw.
+    fn b16(L: *Loader, ck: *core.Checkpoint, name: []const u8) !kern.QLinear {
+        const t = try ck.get(name); // fp16 or bf16 as stored
+        const w = try L.raw(t);
+        const n = t.dim(0);
+        const k = t.dim(1);
+        return .{ .b16 = .{ .w = w, .n = n, .k = k, .fp16 = t.dtype == .f16 } };
+    }
+
     /// One scanned group uploaded as stored; the QLinear carries the launching module.
     fn group(L: *Loader, g: exl3.Group) !kern.QLinear {
         const w = try exl3.upload(L.ops.k.d, L.arena, g);
@@ -109,14 +124,16 @@ const Loader = struct {
     }
 
     fn delta(L: *Loader, ck: *core.Checkpoint, by_name: *std.StringHashMap(exl3.Group), p: []const u8, g: c.Geometry) !wts.Delta {
+        _ = g; // the scanned groups carry their own shapes
         var b1: [224]u8 = undefined;
         var d: wts.Delta = undefined;
         d.qkv = try L.group(by_name.get(try std.fmt.bufPrint(&b1, "{s}linear_attn.in_proj_qkv", .{p})).?);
         d.z = try L.group(by_name.get(try std.fmt.bufPrint(&b1, "{s}linear_attn.in_proj_z", .{p})).?);
-        d.b = try L.group(by_name.get(try std.fmt.bufPrint(&b1, "{s}linear_attn.in_proj_b", .{p})).?);
-        d.a = try L.group(by_name.get(try std.fmt.bufPrint(&b1, "{s}linear_attn.in_proj_a", .{p})).?);
+        // the pack keeps in_proj_a/b unquantized bf16: they load as b16 weights
+        d.b = try L.b16(ck, try std.fmt.bufPrint(&b1, "{s}linear_attn.in_proj_b.weight", .{p}));
+        d.a = try L.b16(ck, try std.fmt.bufPrint(&b1, "{s}linear_attn.in_proj_a.weight", .{p}));
         d.out = try L.group(by_name.get(try std.fmt.bufPrint(&b1, "{s}linear_attn.out_proj", .{p})).?);
-        d.conv = try L.raw(try ck.expect(try std.fmt.bufPrint(&b1, "{s}linear_attn.conv1d.weight", .{p}), .bf16, &.{ g.convDim(), c.conv_taps, 1 }));
+        d.conv = try L.raw(try ck.get(try std.fmt.bufPrint(&b1, "{s}linear_attn.conv1d.weight", .{p}))); // (C, 4, 1) as stored: the reshape moves no bytes
         d.a_log = try L.widen(try ck.get(try std.fmt.bufPrint(&b1, "{s}linear_attn.A_log", .{p})));
         d.dt_bias = try L.widen(try ck.get(try std.fmt.bufPrint(&b1, "{s}linear_attn.dt_bias", .{p})));
         d.norm = try L.vector(ck, try std.fmt.bufPrint(&b1, "{s}linear_attn.norm.weight", .{p}), c.linear_dim);
@@ -131,8 +148,8 @@ const Loader = struct {
             .k = try L.group(by_name.get(try std.fmt.bufPrint(&b1, "{s}self_attn.k_proj", .{p})).?),
             .v = try L.group(by_name.get(try std.fmt.bufPrint(&b1, "{s}self_attn.v_proj", .{p})).?),
             .o = try L.group(by_name.get(try std.fmt.bufPrint(&b1, "{s}self_attn.o_proj", .{p})).?),
-            .q_norm = try L.vector(ck, try std.fmt.bufPrint(&b1, "{s}self_attn.q_norm.weight", .{p}), c.head_dim),
-            .k_norm = try L.vector(ck, try std.fmt.bufPrint(&b1, "{s}self_attn.k_norm.weight", .{p}), c.head_dim),
+            .q_norm = try L.centred(ck, try std.fmt.bufPrint(&b1, "{s}self_attn.q_norm.weight", .{p}), c.head_dim),
+            .k_norm = try L.centred(ck, try std.fmt.bufPrint(&b1, "{s}self_attn.k_norm.weight", .{p}), c.head_dim),
         };
     }
 };
@@ -166,18 +183,25 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, lin: *const exl3.
     for (w.layers, 0..) |*layer, i| {
         var pb: [64]u8 = undefined;
         var nb: [224]u8 = undefined;
-        const p = try std.fmt.bufPrint(&pb, "model.layers.{d}.", .{i});
-        layer.input_norm = try L.vector(&ck, try std.fmt.bufPrint(&nb, "{s}input_layernorm.weight", .{p}), g.hidden);
+        const p = try std.fmt.bufPrint(&pb, "{s}layers.{d}.", .{ prefix, i });
+        layer.input_norm = try L.centred(&ck, try std.fmt.bufPrint(&nb, "{s}input_layernorm.weight", .{p}), g.hidden);
         layer.mixer = if (c.linear(i)) .{ .delta = try L.delta(&ck, &by_name, p, g) } else .{ .attention = try L.attention(&ck, &by_name, p, g) };
         layer.gate = try L.group(by_name.get(try std.fmt.bufPrint(&nb, "{s}mlp.gate_proj", .{p})).?);
         layer.up = try L.group(by_name.get(try std.fmt.bufPrint(&nb, "{s}mlp.up_proj", .{p})).?);
         layer.down = try L.group(by_name.get(try std.fmt.bufPrint(&nb, "{s}mlp.down_proj", .{p})).?);
-        layer.post_norm = try L.vector(&ck, try std.fmt.bufPrint(&nb, "{s}post_attention_layernorm.weight", .{p}), g.hidden);
+        layer.post_norm = try L.centred(&ck, try std.fmt.bufPrint(&nb, "{s}post_attention_layernorm.weight", .{p}), g.hidden);
     }
-    w.embed = .{ .b16 = .{ .w = try L.raw(try ck.expect(prefix ++ "model.embed_tokens.weight", .bf16, &.{ c.vocab, g.hidden })), .d = g.hidden } };
-    w.norm = try L.vector(&ck, "model.norm.weight", g.hidden);
+    w.embed = .{ .b16 = .{ .w = try L.raw(try ck.expect(prefix ++ "embed_tokens.weight", .bf16, &.{ c.vocab, g.hidden })), .d = g.hidden } };
+    w.norm = try L.centred(&ck, prefix ++ "norm.weight", g.hidden);
     w.head = try L.group(by_name.get("lm_head").?);
-    if (ck.unused() != 0) return error.UnusedCheckpointTensors;
+    // the MTP head stays on disk (as the MLX loader skips it): DFlash2 is the drafter here
+    for (ck.files.items) |*f| for (f.names.keys()) |key| {
+        if (ck.used.contains(key)) continue;
+        if (!std.mem.startsWith(u8, key, "mtp.") and !std.mem.startsWith(u8, key, "model.visual.")) {
+            std.log.err("unused tensor outside the text model: {s}", .{key});
+            return error.UnusedCheckpointTensors;
+        }
+    };
     var inv: [c.rotary_dim / 2]f32 = undefined;
     wts.invFreq(&inv);
     w.inv_freq = try L.alloc(@sizeOf(@TypeOf(inv)));

@@ -97,7 +97,7 @@ const lin_syms = [_]Sym{
     .{ .k2 = 16, .cb = 1, .wk = 4, .name = "_ZN14tf_exl3_linear13linear_kernelILi16ELi1ELi4EEEvPK6__halfPKjxxS3_S3_PviPfPiiiii" },
     .{ .k2 = 16, .cb = 1, .wk = 8, .name = "_ZN14tf_exl3_linear13linear_kernelILi16ELi1ELi8EEEvPK6__halfPKjxxS3_S3_PviPfPiiiii" },
     .{ .k2 = 16, .cb = 2, .wk = 4, .name = "_ZN14tf_exl3_linear13linear_kernelILi16ELi2ELi4EEEvPK6__halfPKjxxS3_S3_PviPfPiiiii" },
-    .{ .k2 = 16, .cb = 2, .wk = 8, .name = "_ZN14tf_exl3_linear13linear_kernelILi16ELi2ELi8EEEvPK6__halfPKjxxS3_PviPfPiiiii" },
+    .{ .k2 = 16, .cb = 2, .wk = 8, .name = "_ZN14tf_exl3_linear13linear_kernelILi16ELi2ELi8EEEvPK6__halfPKjxxS3_S3_PviPfPiiiii" },
 };
 
 // unpack: W_q [K, N] fp16 from either layout's words, one warp a tile.
@@ -187,6 +187,7 @@ pub const Linear = struct {
         args.add(suh.ptr);
         args.add(xh.ptr);
         args.add(@as(c_int, @intCast(k)));
+        if (std.c.getenv("TF_TRACE_LAUNCH") != null) std.debug.print("[rotIn] blocks={d} m={d} k={d}\n", .{ blocks, m, k });
         try launch.launch(l.rot_in, .{ .grid = .{ .x = @intCast(blocks), .y = @intCast(m), .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &args);
     }
 
@@ -220,6 +221,7 @@ pub const Linear = struct {
         args.add(@as(c_int, @intCast(w.n)));
         args.add(@as(c_int, @intCast(p.sk)));
         const grid_x: u32 = @intCast(w.n / 128);
+        if (std.c.getenv("TF_TRACE_LAUNCH") != null) std.debug.print("[matmul] grid=({d},{d}) wk={d} m={d} k={d} n={d} shared={d}\n", .{ grid_x, p.sk, p.wk, m, w.k, w.n, shared });
         try launch.launch(f, .{
             .grid = .{ .x = grid_x, .y = @intCast(p.sk), .z = 1 },
             .block = .{ .x = @intCast(p.wk * 32), .y = 1, .z = 1 },
@@ -236,6 +238,7 @@ pub const Linear = struct {
         args.add(suh);
         args.add(xh);
         args.add(@as(c_int, @intCast(k)));
+        if (std.c.getenv("TF_TRACE_LAUNCH") != null) std.debug.print("[rotIn] blocks={d} m={d} k={d}\n", .{ blocks, m, k });
         try launch.launch(l.rot_in, .{ .grid = .{ .x = @intCast(blocks), .y = @intCast(m), .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &args);
     }
 
@@ -244,6 +247,7 @@ pub const Linear = struct {
         const p = w.split();
         const f = try l.function(p.wk, w.codebook, w.width.halves);
         const shared: u32 = @intCast(p.wk * @min(m, 8) * 128 * 4);
+        if (std.c.getenv("TF_TRACE_LAUNCH") != null) std.debug.print("[matmul] entering wk={d} shared={d} k={d} n={d} m={d} sk={d}\n", .{ p.wk, shared, w.k, w.n, m, p.sk });
         if (shared > 48 * 1024) try f.allowDynamicShared(shared);
         var args = launch.Args{};
         args.add(xh);
@@ -261,6 +265,7 @@ pub const Linear = struct {
         args.add(@as(c_int, @intCast(w.n)));
         args.add(@as(c_int, @intCast(p.sk)));
         const grid_x: u32 = @intCast(w.n / 128);
+        if (std.c.getenv("TF_TRACE_LAUNCH") != null) std.debug.print("[matmul] grid=({d},{d}) wk={d} m={d} k={d} n={d} shared={d}\n", .{ grid_x, p.sk, p.wk, m, w.k, w.n, shared });
         try launch.launch(f, .{
             .grid = .{ .x = grid_x, .y = @intCast(p.sk), .z = 1 },
             .block = .{ .x = @intCast(p.wk * 32), .y = 1, .z = 1 },
@@ -268,17 +273,18 @@ pub const Linear = struct {
         }, s, &args);
     }
 
-    /// W_q [k, n] fp16 unpacked from the trellis, once a prompt chunk.
+    /// W_q [k, n] fp16 unpacked from the trellis, once a prompt chunk: unpack_kernel(T, W, N, stride_k, stride_nb),
+    /// one warp a 16x16 tile over grid (N/16, K/16), as exl3_unpack_cuda launches it (__launch_bounds__(32)).
     pub fn unpackPtr(l: *const Linear, s: stream_.Stream, w: Weight, out: u64) !void {
         const f = try l.unpackFn(w.width.halves, w.codebook);
         var args = launch.Args{};
         args.add(w.trellis.ptr);
         args.add(out);
+        args.add(@as(c_int, @intCast(w.n)));
         args.add(@as(i64, @intCast(w.strideK())));
         args.add(@as(i64, @intCast(w.strideN())));
-        args.add(@as(c_int, @intCast(w.width.halves)));
-        args.add(@as(c_int, @intFromEnum(w.codebook)));
-        try launch.launch(f, .{ .grid = .{ .x = @intCast((w.k / 16 + 3) / 4), .y = @intCast(w.n / 128), .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &args);
+        if (std.c.getenv("TF_TRACE_LAUNCH") != null) std.debug.print("[unpack] grid=({d},{d}) k={d} n={d} halves={d} cb={d}\n", .{ w.n / 16, w.k / 16, w.k, w.n, w.width.halves, @intFromEnum(w.codebook) });
+        try launch.launch(f, .{ .grid = .{ .x = @intCast(w.n / 16), .y = @intCast(w.k / 16), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &args);
     }
 
     fn unpackFn(l: *const Linear, halves: u16, cb: Codebook) !@import("module.zig").Function {

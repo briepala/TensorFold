@@ -29,6 +29,12 @@ pub const Forward = struct {
         return f.w.g;
     }
 
+    /// in_proj_a/b's storage dtype: an EXL3 pack keeps them fp16, an MLX pack's tiled copy is bf16.
+    fn abF16(f: *const Forward, q: kern.QLinear) bool {
+        _ = f;
+        return switch (q) { .b16 => |b| b.fp16, else => false };
+    }
+
     fn gdnShape(f: *const Forward) tri.Gdn {
         const g_ = f.g();
         return .{ .c = g_.convDim(), .kh = g_.linear_k_heads, .vh = g_.linear_v_heads, .dk = c.linear_dim, .keep = c.conv_taps - 1 };
@@ -57,8 +63,8 @@ pub const Forward = struct {
                 a.add(b.w);
                 a.add(out);
                 a.add(@as(c_int, @intCast(b.d)));
-                a.add(@as(c_int, @intCast(rows)));
-                try cuda.launch.launch(f.ops.k.b16_embed, .{ .grid = .{ .x = @intCast((rows + 255) / 256), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, f.ops.s, &a);
+                if (std.c.getenv("TF_TRACE_LAUNCH") != null) std.debug.print("[embed-b16] rows={d} d={d}\n", .{ rows, b.d });
+                try cuda.launch.launch(f.ops.k.b16_embed, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 32 } }, f.ops.s, &a);
             },
         }
     }
@@ -119,7 +125,7 @@ pub const Forward = struct {
                     try f.ops.dense(s.y, s.xs, d.b, s.b, W);
                     try f.ops.dense(s.y, s.xs, d.a, s.a, W);
                     const sid: ?u64 = if (r.multi) r.sids else null;
-                    try f.t.gdnPre(rec.qkv, r.conv(parts, s, g_, i, lin), d.conv, r.windows, sid, s.a, s.b, d.a_log, d.dt_bias, rec.q, rec.k, rec.v, rec.g, rec.beta, W, f.gdnShape());
+                    try f.t.gdnPre(rec.qkv, r.conv(parts, s, g_, i, lin), d.conv, r.windows, sid, s.a, s.b, d.a_log, d.dt_bias, rec.q, rec.k, rec.v, rec.g, rec.beta, W, f.gdnShape(), f.abF16(d.a));
                     const state = if (r.multi) 0 else parts[0].seq.rec[i];
                     const table = if (r.multi) r.table(lin) else 0;
                     try f.ops.gdnTree(rec.q, rec.k, rec.v, rec.g, rec.beta, state, table, if (r.multi) r.starts else 0, r.plan, s.yr, W, r.streams, r.slots, r.most, f.heads());
@@ -263,7 +269,7 @@ pub const Forward = struct {
                     try f.ops.prefillDense(s.y, d.z, s.z, W);
                     try f.ops.prefillDense(s.y, d.b, s.b, W);
                     try f.ops.prefillDense(s.y, d.a, s.a, W);
-                    try f.t.gdnPre(s.qkv, seq.conv[i], d.conv, s.windows, null, s.a, s.b, d.a_log, d.dt_bias, s.gq, s.gk, s.gv, s.gg, s.gbeta, W, f.gdnShape());
+                    try f.t.gdnPre(s.qkv, seq.conv[i], d.conv, s.windows, null, s.a, s.b, d.a_log, d.dt_bias, s.gq, s.gk, s.gv, s.gg, s.gbeta, W, f.gdnShape(), f.abF16(d.a));
                     // each thread reads its state rows before it writes them: the chain may end in place
                     try f.ops.gdnPrompt(s.gq, s.gk, s.gv, s.gg, s.gbeta, seq.rec[i], seq.rec[i], s.yr, W, f.heads());
                     if (W >= keep) {
@@ -396,7 +402,7 @@ pub const Forward = struct {
                     try f.ops.prefillDense(s.y, d.b, s.b, W);
                     try f.ops.prefillDense(s.y, d.a, s.a, W);
                     const cat = s.conv_cat + lin_n * st.max_streams * keep * row;
-                    try f.t.gdnPre(s.qkv, cat, d.conv, s.windows, s.sids, s.a, s.b, d.a_log, d.dt_bias, s.gq, s.gk, s.gv, s.gg, s.gbeta, W, f.gdnShape());
+                    try f.t.gdnPre(s.qkv, cat, d.conv, s.windows, s.sids, s.a, s.b, d.a_log, d.dt_bias, s.gq, s.gk, s.gv, s.gg, s.gbeta, W, f.gdnShape(), f.abF16(d.a));
                     for (pieces, 0..) |p, k| {
                         const o = starts[k];
                         // each thread reads its state rows before it writes them: the chain may end in place

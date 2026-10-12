@@ -100,9 +100,10 @@ fn codebookOf(v: View, prefix: []const u8) Codebook {
     return .inst3;
 }
 
+/// A codebook marker is there or not, as linear.py reads it: packs store a scalar int32 (format.MARKERS' value).
 fn markerAt(v: View, name: []const u8) bool {
-    const t = v.get(name) catch return false;
-    return t.bytes.len == 0;
+    _ = v.get(name) catch return false;
+    return true;
 }
 
 fn widthOf(trellis: Entry) !Width {
@@ -156,7 +157,13 @@ test "scan reads a small synthetic checkpoint" {
             _ = byte_count;
             const f: *@This() = @ptrCast(@alignCast(ptr));
             for (f.names) |n| if (std.mem.eql(u8, n, name)) {
-                if (std.mem.endsWith(u8, name, ".mul1")) return .{ .dtype = .other, .shape = .{ 0, 0, 0 }, .rank = 0, .bytes = &.{} };
+                if (std.mem.endsWith(u8, name, ".mul1")) {
+                    // as packs store it: a scalar int32, format.MARKERS["mul1"]
+                    const S = struct {
+                        var marker: [4]u8 = .{ 0x2D, 0xD1, 0xDC, 0x83 };
+                    };
+                    return .{ .dtype = .other, .shape = .{ 1, 1, 1 }, .rank = 0, .bytes = &S.marker };
+                }
                 if (std.mem.endsWith(u8, name, ".trellis")) {
                     // K/16 = 2, N/16 = 8, 16*bits words = 24 (1.5 bits): shape [2, 8, 24]
                     const S = struct {

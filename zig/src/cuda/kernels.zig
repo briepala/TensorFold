@@ -95,6 +95,13 @@ pub const exl3_symbols = struct {
     pub const unpack_prefix = "_ZN14tf_exl3_linear13unpack_kernelI";
 };
 
+/// The b16 image's fp16 row-kernel names (template __half), from cuobjdump of the sm_86 build.
+pub const b16_f16_symbols = struct {
+    pub const rows_1 = "_ZN6tf_b1610b16_kernelI6__halfLi1ELi4EEEvPKT_S4_S4_PS2_iiiS4_S5_i";
+    pub const rows_4 = "_ZN6tf_b1610b16_kernelI6__halfLi4ELi8EEEvPKT_S4_S4_PS2_iiiS4_S5_i";
+    pub const rows_16 = "_ZN6tf_b1610b16_kernelI6__halfLi16ELi16EEEvPKT_S4_S4_PS2_iiiS4_S5_i";
+};
+
 /// The b16 image's mangled names (namespace tf_b16), from cuobjdump of the sm_86 build.
 pub const b16_symbols = struct {
     pub const bf16_rows_1 = "_ZN6tf_b1610b16_kernelI13__nv_bfloat16Li1ELi4EEEvPKT_S4_S4_PS2_iiiS4_S5_i";
@@ -111,7 +118,8 @@ pub const q27_symbols = struct {
     pub const gated_norm = "_ZN6tf_q2710gated_normEPK13__nv_bfloat16S2_S2_PS0_Pffii";
     pub const swiglu = "_ZN6tf_q276swigluEPK13__nv_bfloat16S2_PS0_Pfi";
     pub const gate_mul = "_ZN6tf_q278gate_mulEPK13__nv_bfloat16S2_PS0_Pfii";
-    pub const b16_embed = "_ZN6tf_q279b16_embedEPKxPK13__nv_bfloat16PS2_i";
+    pub const b16_embed = "_ZN6tf_q279b16_embedEPKiPK13__nv_bfloat16PS2_i";
+    pub const bf16_to_f16 = "_ZN6tf_q2711bf16_to_f16EPK13__nv_bfloat16P6__halfx";
     pub const gdn_pre = "_ZN6tf_q277gdn_preEPK13__nv_bfloat16S2_S2_PKiS2_S2_PKfS2_PS0_S7_S7_PfS8_iiiii";
     pub const attn_prep = "_ZN6tf_q279attn_prepEPK13__nv_bfloat16S2_S2_S2_PKfS4_PS0_S5_fiiiiiii";
     pub const attn_row = "_ZN6tf_q278attn_rowEPK13__nv_bfloat16S2_S2_PS0_iiixf";

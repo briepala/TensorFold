@@ -80,6 +80,16 @@ pub fn main(init: std.process.Init) !u8 {
     while (it.next()) |entry| {
         const name = entry.key_ptr.*;
         const ids = try tokenList(arena, entry.value_ptr.*);
+        if (o.dump) |dir| {
+            // run --dump DIR --cases NAME: that prompt's one pass alone, every norm's (h, y) rows as capture.py's prefill/<case>
+            if (!std.mem.eql(u8, o.cases orelse "", name)) continue;
+            try seq.reset(e.ops(), e.w.g);
+            var f = e.forward();
+            f.dump = .{ .io = init.io, .dir = dir };
+            try f.chunk(ids, &seq, true);
+            std.debug.print("{s}: prompt {d}, {d} norms dumped into {s}\n", .{ name, ids.len, f.dump.?.n, dir });
+            continue;
+        }
         var out: std.ArrayList(u32) = .empty;
         defer out.deinit(gpa);
         t0 = clock.now(init.io).toNanoseconds();

@@ -57,9 +57,10 @@ pub const Tri = struct {
     }
 
     /// glue.gdn_pre: conv over each row's window of [state; qkv], q/k norms, g and beta; `sid`: several streams.
-    pub fn gdnPre(t: Tri, qkv: u64, cs: u64, cw: u64, win: u64, sid: ?u64, a: u64, b: u64, alog: u64, dtb: u64, q: u64, k: u64, v: u64, g: u64, beta: u64, rows: usize, m: Gdn) !void {
+    pub fn gdnPre(t: Tri, qkv: u64, cs: u64, cw: u64, win: u64, sid: ?u64, a: u64, b: u64, alog: u64, dtb: u64, q: u64, k: u64, v: u64, g: u64, beta: u64, rows: usize, m: Gdn, ab_f16: bool) !void {
+        const abty: []const u8 = if (ab_f16) "*fp16" else "*bf16";
         try t.run("_gdn_pre", .{ u(rows), u(2 * m.kh + m.vh), 1 }, &.{
-            p("QKV", "*bf16", qkv), p("CS", "*bf16", cs), p("CW", "*bf16", cw), p("WIN", "*i32", win), p("A", "*bf16", a), p("B", "*bf16", b),       p("ALOG", "*fp32", alog),
+            p("QKV", "*bf16", qkv), p("CS", "*bf16", cs), p("CW", "*bf16", cw), p("WIN", "*i32", win), p("A", abty, a), p("B", abty, b), p("ALOG", "*fp32", alog),
             p("DTB", "*fp32", dtb), p("Q", "*bf16", q),   p("K", "*bf16", k),   p("V", "*bf16", v),    p("G", "*fp32", g), p("BETA", "*fp32", beta), p("SID", "*i32", sid orelse win),
         }, &.{ ci("C", m.c), ci("KH", m.kh), ci("VH", m.vh), ci("DK", m.dk), ci("NKEEP", m.keep), ci("MULTI", @intFromBool(sid != null)) });
     }

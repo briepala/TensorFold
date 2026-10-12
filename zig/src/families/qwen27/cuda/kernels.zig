@@ -68,19 +68,22 @@ pub const Affine4 = struct { w: u64, s: u64, b: u64, n: usize, k: usize, npad: u
 /// An EXL3 projection: the trellis weight plus the module that launches it.
 pub const Exl3W = struct { w: cuda.exl3.Weight, lin: *const cuda.exl3.Linear };
 
-/// An unquantized bf16 weight: (n, k) row-major.
-pub const B16W = struct { w: u64, n: usize, k: usize };
+/// An unquantized weight: (n, k) row-major, fp16 or bf16 as stored.
+pub const B16W = struct { w: u64, n: usize, k: usize, fp16: bool = false };
 
 pub const Kernels = struct {
     d: *const cuda.Driver,
-    mods: [17]cuda.Module,
+    mods: [18]cuda.Module,
     mods_loaded: usize = 15, // the 15 base images; slots 15/16 are exl3 and b16 when they loaded
     exl3: cuda.exl3.Linear = undefined,
     b16_rows: [3]cuda.Function = undefined, // R = 1, 4, 16 (bf16)
-    b16_prompt: [3]cuda.Function = undefined, // BM = 32, 64, 128
+    b16_prompt: [3]cuda.Function = undefined, // BM = 32, 64, 128 (bf16)
+    f16_rows: [3]cuda.Function = undefined, // the fp16 instantiations (in_proj_a/b are fp16 in the packs)
     exl3_on: bool = false,
     b16_on: bool = false,
     b16_embed: cuda.Function = undefined, // q27_rows.cu's b16_embed: bf16 table rows gathered by id
+    to_f16: cuda.Function = undefined, // q27_rows.cu's bf16_to_f16: an fp16 weight's inputs, as b16.matmul casts them
+    q27_rows_mod: ?cuda.Module = null, // loaded best-effort beside b16
     triton: cuda.aot.Set,
     group: cuda.Function,
     wide: [wide.len]cuda.Function, // tiles 3-5: rows <= 32, <= 64, more
@@ -92,6 +95,7 @@ pub const Kernels = struct {
     replay: cuda.Function,
     prompt_chain: cuda.Function,
     prompt_rows: usize, // the prompt chain's value rows a block: 64 when heads < SMs
+    pack_mod: cuda.Module, // affine4_pack: the MLX repack (pack_dense, transpose16)
     pack_dense: cuda.Function,
     transpose16: cuda.Function,
     argmax: cuda.Function,
@@ -115,32 +119,58 @@ pub const Kernels = struct {
         k.d = d;
         const kk = cuda.kernels;
         const images = [_][]const u8{ kk.qmm_group, kk.qmm_prefill, kk.lane_gemv, kk.prefill_attention, kk.gdn, kk.gdn_prefill, kk.nemotron_ops, kk.torch_argmax, kk.torch_topk, kk.torch_pointwise, kk.torch_indexing, kk.torch_movement, kk.torch_nemotron_constants, kk.qwen_ops, kk.torch_norm_rotary };
-        // the sm_86 additions load best-effort: an EXL3 pack needs them, an MLX pack never touches them
-        k.exl3_on = false;
+        // the sm_86 additions load best-effort: an EXL3 pack needs them, an MLX pack never touches them.
+        // Fixed slots past the 15 base images: 15 exl3_linear, 16 b16, 17 q27_rows.
+        var loaded_extra: usize = 0;
         if (cuda.Module.load(d, kk.exl3_linear)) |m| {
-            k.mods[15] = m; // the Kernels owns this module's lifetime (deinit unloads it)
-            if (k.mods_loaded == 15) {
-                k.mods_loaded = 16;
-            } else {
-                k.mods_loaded = 17;
-            }
+            k.mods[15] = m;
+            loaded_extra += 1;
+            k.mods_loaded = 15 + loaded_extra;
             k.exl3 = try cuda.exl3.Linear.fromModule(d, &k.mods[15]);
             k.exl3_on = true;
-        } else |_| {}
-        if (cuda.Module.load(d, kk.b16)) |m| {
-            k.mods[16] = m; // its own slot beside exl3
-            const mod = &k.mods[16];
-            if (k.mods_loaded == 15) {
-                k.mods_loaded = 17;
-            } else {
-                k.mods_loaded = 17;
+            if (std.c.getenv("TF_SMOKE_EXL3") != null) {
+                // isolation: rotIn on synthetic buffers through the exact serving path
+                var s = try cuda.Stream.init(ctx.d, true);
+                defer s.deinit();
+                const rows2: usize = 4;
+                const kk2: usize = 5120;
+                var x = try cuda.DeviceBuffer.alloc(ctx.d, rows2 * kk2 * 2);
+                defer x.free();
+                var suh = try cuda.DeviceBuffer.alloc(ctx.d, kk2 * 2);
+                defer suh.free();
+                var xh = try cuda.DeviceBuffer.alloc(ctx.d, rows2 * kk2 * 2);
+                defer xh.free();
+                try k.exl3.rotInPtr(s, x.ptr, suh.ptr, xh.ptr, rows2, kk2);
+                try s.synchronize();
+                std.debug.print("SMOKE rotIn OK\n", .{});
             }
-            const bs = cuda.kernels.b16_symbols;
-            k.b16_embed = try mod.function(cuda.kernels.q27_symbols.b16_embed);
-            k.b16_rows = .{ try mod.function(bs.bf16_rows_1), try mod.function(bs.bf16_rows_4), try mod.function(bs.bf16_rows_16) };
-            k.b16_prompt = .{ try mod.function(bs.bf16_prompt_32), try mod.function(bs.bf16_prompt_64), try mod.function(bs.bf16_prompt_128) };
+        } else |e| {
+            std.log.err("exl3_linear module failed to load: {}", .{e});
+        }
+        if (cuda.Module.load(d, kk.b16)) |m| {
+            k.mods[16] = m;
+            loaded_extra += 1;
+            k.mods_loaded = 15 + loaded_extra;
             k.b16_on = true;
-        } else |_| {}
+            const bs = cuda.kernels.b16_symbols;
+            k.b16_rows = .{ try k.mods[16].function(bs.bf16_rows_1), try k.mods[16].function(bs.bf16_rows_4), try k.mods[16].function(bs.bf16_rows_16) };
+            const fs = cuda.kernels.b16_f16_symbols;
+            k.f16_rows = .{ try k.mods[16].function(fs.rows_1), try k.mods[16].function(fs.rows_4), try k.mods[16].function(fs.rows_16) };
+            k.b16_prompt = .{ try k.mods[16].function(bs.bf16_prompt_32), try k.mods[16].function(bs.bf16_prompt_64), try k.mods[16].function(bs.bf16_prompt_128) };
+            // prompt_launch's one-time opt-in: BM 64 and 128 stage more than 48 KiB of dynamic shared memory
+            for (k.b16_prompt, prompt_bms) |f, bm| try f.allowDynamicShared(promptSmem(bm));
+        } else |e| {
+            std.log.err("b16 module failed to load: {}", .{e});
+        }
+        if (cuda.Module.load(d, kk.q27_rows)) |m| {
+            k.mods[17] = m;
+            loaded_extra += 1;
+            k.mods_loaded = 15 + loaded_extra;
+            k.b16_embed = try k.mods[17].function(cuda.kernels.q27_symbols.b16_embed);
+            k.to_f16 = try k.mods[17].function(cuda.kernels.q27_symbols.bf16_to_f16);
+        } else |e| {
+            std.log.err("q27_rows module failed to load: {} — b16_embed stays unset", .{e});
+        }
         var loaded: usize = 0;
         errdefer for (k.mods[0..loaded]) |*m| m.unload();
         for (images, 0..) |img, i| {
@@ -155,8 +185,11 @@ pub const Kernels = struct {
         k.pattn = try k.mods[3].function(sym.pattn);
         for (&k.trees, cuda.kernels.gdn_variants) |*f, v| f.* = try k.mods[4].function(v.symbol);
         k.replay = try k.mods[4].function(cuda.kernels.gdn_symbols.replay_bf16);
-        k.pack_dense = try k.mods[6].function("tf_pack_dense");
-        k.transpose16 = try k.mods[6].function("tf_transpose_pad16");
+        // #602 moved the affine-4 repack out of nemotron_ops into its own image, as Nemotron's loader takes it
+        k.pack_mod = try cuda.Module.load(d, kk.affine4_pack);
+        errdefer k.pack_mod.unload();
+        k.pack_dense = try k.pack_mod.function("tf_pack_dense");
+        k.transpose16 = try k.pack_mod.function("tf_transpose_pad16");
         k.argmax = try k.mods[7].function(sym.argmax);
         k.torch = try torch_ops.Functions.resolve(k.mods[7..13]);
         k.copy_batch = try k.mods[13].function("tf_copy_batch");
@@ -190,6 +223,7 @@ pub const Kernels = struct {
     pub fn deinit(k: *Kernels) void {
         k.triton.deinit();
         for (k.mods[0..k.mods_loaded]) |*m| m.unload();
+        k.pack_mod.unload();
     }
 };
 
@@ -210,6 +244,22 @@ fn u(x: usize) u32 {
     return @intCast(x);
 }
 
+/// b16.cu's prompt tiles: PBN columns a block, PST stages of (BM + PBN) rows of PROW bytes in dynamic shared memory.
+const prompt_bn = 64;
+const prompt_bms = [3]usize{ 32, 64, 128 };
+
+fn promptSmem(bm: usize) u32 {
+    return @intCast(3 * (bm + prompt_bn) * 128);
+}
+
+/// prompt_bm: the tallest tile that still gives two blocks an SM (narrow weights take short tiles); never a row's bits.
+fn promptBm(rows: usize, n: usize, sms: usize) usize {
+    const cols = (n + prompt_bn - 1) / prompt_bn;
+    var b: usize = 128;
+    while (b > 32 and cols * ((rows + b - 1) / b) < 2 * sms) b /= 2;
+    return b;
+}
+
 /// The GDN shapes every launch takes: key heads, value heads, value rows a head.
 pub const Heads = struct { hk: usize, hv: usize, dv: usize };
 
@@ -220,6 +270,9 @@ pub const Ops = struct {
     trellis: ?*Trellis = null, // the EXL3 decode scratch (xh, z), owned by the engine's scratch
 
     fn go(o: Ops, f: cuda.Function, grid: [3]usize, block: u32, shared: u32, args: *cuda.Args) !void {
+        if (std.c.getenv("TF_TRACE_LAUNCH") != null) {
+            std.debug.print("[launch] grid=({d},{d},{d}) block={d} shared={d}\n", .{ grid[0], grid[1], grid[2], block, shared });
+        }
         try cuda.launch.launch(f, .{ .grid = .{ .x = u(grid[0]), .y = u(grid[1]), .z = u(grid[2]) }, .block = .{ .x = block }, .shared = shared }, o.s, args);
     }
 
@@ -239,6 +292,7 @@ pub const Ops = struct {
 
     /// The trellis GEMV: rot_in (bf16 x -> fp16 xh) then linear, the row-invariant decode path.
     fn exl3Dense(o: Ops, e: Exl3W, x: u64, out: u64, rows: usize) !void {
+        if (std.c.getenv("TF_SKIP_EXL3") != null) return; // bisect: skip the trellis launches
         const t = o.trellis orelse return error.TrellisScratchMissing;
         const xh = try t.xhAt(rows, e.w.k);
         try e.lin.rotInPtr(o.s, x, e.w.suh.ptr, xh, rows, e.w.k);
@@ -247,13 +301,15 @@ pub const Ops = struct {
         try e.lin.matmulPtr(o.s, e.w, xh, out, z, rows);
     }
 
-    /// b16 rows: a warp a column over R rows (R by row count: 1, 4, 16).
+    /// b16 rows: a warp a column over R rows (R by row count: 1, 4, 16), fp16 or bf16 weights.
+    /// An fp16 weight reads x cast to fp16 and writes fp16 rows, as b16.matmul's x.to(w.dtype) does.
     fn b16Rows(o: Ops, x: u64, b: B16W, out: u64, rows: usize) !void {
         const i: usize = if (rows <= 1) 0 else if (rows <= 4) 1 else 2;
         const r: usize = switch (i) { 0 => 1, 1 => 4, else => 16 };
         const warps: usize = switch (i) { 0 => 4, 1 => 8, else => 16 };
+        const xin = if (b.fp16) try o.toF16(x, rows * b.k) else x;
         var a: cuda.Args = .{};
-        a.add(x);
+        a.add(xin);
         a.add(b.w);
         a.add(@as(u64, 0)); // bias: none
         a.add(out);
@@ -261,7 +317,8 @@ pub const Ops = struct {
         a.add(@as(u64, 0)); // second weight
         a.add(@as(u64, 0)); // second out
         a.add(@as(c_int, 0)); // second n
-        try o.go(o.k.b16_rows[i], .{ (b.n + warps - 1) / warps, (rows + r - 1) / r, 1 }, @intCast(warps * 32), 0, &a);
+        const f = if (b.fp16) o.k.f16_rows[i] else o.k.b16_rows[i];
+        try o.go(f, .{ (b.n + warps - 1) / warps, (rows + r - 1) / r, 1 }, @intCast(warps * 32), 0, &a);
     }
 
     /// qmm.matmul at a K split the caller names (matmul_rows takes the stacked weight's for each part).
@@ -360,6 +417,7 @@ pub const Ops = struct {
 
     /// The EXL3 prompt path: rot_in, W_q unpacked once, the captured _gemm with the Hadamard epilogue.
     fn exl3Prefill(o: Ops, e: Exl3W, x: u64, out: u64, rows: usize) !void {
+        if (std.c.getenv("TF_SKIP_EXL3") != null) return; // bisect
         const t = o.trellis orelse return error.TrellisScratchMissing;
         const xh = try t.xhAt(rows, e.w.k);
         try e.lin.rotInPtr(o.s, x, e.w.suh.ptr, xh, rows, e.w.k);
@@ -378,10 +436,15 @@ pub const Ops = struct {
         });
     }
 
-    /// b16 prompts: the BM-tile kernel (32/64/128 by row count).
+    /// b16.prompt: bf16 weights on the BM-tile mma kernel; an fp16 weight (in_proj_a/b) or K off 64 takes b16.matmul.
     fn b16Prompt(o: Ops, x: u64, b: B16W, out: u64, rows: usize) !void {
-        const i: usize = if (rows <= 32) 0 else if (rows <= 64) 1 else 2;
-        const bm: usize = switch (i) { 0 => 32, 1 => 64, else => 128 };
+        if (b.fp16 or b.k % 64 != 0) return o.b16Rows(x, b, out, rows);
+        const bm = promptBm(rows, b.n, @intCast(o.k.chip[2]));
+        const i: usize = switch (bm) {
+            32 => 0,
+            64 => 1,
+            else => 2,
+        };
         var a: cuda.Args = .{};
         a.add(x);
         a.add(b.w);
@@ -390,7 +453,19 @@ pub const Ops = struct {
         a.add(@as(u64, 0));
         a.add(@as(u64, 0));
         a.add(@as(c_int, 0));
-        try o.go(o.k.b16_prompt[i], .{ (b.n + 127) / 128, (rows + bm - 1) / bm, 1 }, 128, 0, &a);
+        try o.go(o.k.b16_prompt[i], .{ (b.n + prompt_bn - 1) / prompt_bn, (rows + bm - 1) / bm, 1 }, 128, promptSmem(bm), &a);
+    }
+
+    /// bf16 rows to fp16 in the trellis scratch's xh (free between EXL3 calls, which rewrite it before reading).
+    fn toF16(o: Ops, x: u64, n: usize) !u64 {
+        const t = o.trellis orelse return error.TrellisScratchMissing;
+        const y = try t.xhAt(1, n);
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(y);
+        a.add(@as(i64, @intCast(n)));
+        try o.go(o.k.to_f16, .{ @min((n + 255) / 256, 4096), 1, 1 }, 256, 0, &a);
+        return y;
     }
 
     /// 1/sqrt(128) as fp32 bits, the _gemm epilogue's SCALE (prefill.py's HAD_SCALE).

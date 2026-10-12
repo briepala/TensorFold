@@ -355,8 +355,7 @@ pub const DFlash2 = struct {
                 a.add(b.w);
                 a.add(x.x);
                 a.add(@as(c_int, @intCast(b.d)));
-                a.add(@as(c_int, @intCast(rows)));
-                try cuda.launch.launch(x.ops.k.b16_embed, .{ .grid = .{ .x = @intCast((rows + 255) / 256), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, x.ops.s, &a);
+                try cuda.launch.launch(x.ops.k.b16_embed, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 32 } }, x.ops.s, &a);
             },
         }
         try x.rotary(runs[0..S]);
@@ -393,11 +392,11 @@ pub const DFlash2 = struct {
         // matmul_rows: the head's spans at the stacked rows' K split (1), then joined column-wise
         try x.t.groupSums(x.head_h, x.xs, H, total, H);
         const head = tw.head;
-        // the head's first span: the same weight with n cut to the span (affine4's row views make this free)
+        // the head's first span: the same weight with n cut to the span (row views make this free)
         const first: kern.QLinear = switch (head) {
             .affine4 => |a| .{ .affine4 = .{ .w = a.w, .s = a.s, .b = a.b, .n = dl.spans[0][1], .k = a.k, .npad = a.npad } },
             .exl3 => |e| .{ .exl3 = e },   // the trellis head serves both spans by column block in one launch
-            .b16 => |b| .{ .b16 = b },
+            .b16 => |b| .{ .b16 = .{ .w = b.w, .n = dl.spans[0][1], .k = b.k } },
         };
         try x.ops.denseSplit(x.head_h, x.xs, first, x.logits32, total, 1); // a scratch of the right size
         try x.ops.denseSplit(x.head_h, x.xs, x.w.head_tail, x.logits_tail, total, 1);

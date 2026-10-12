@@ -158,6 +158,7 @@ pub const Set = struct {
                 .u64 => |x| packed_args.add(x),
             }
         }
+        if (std.c.getenv("TF_TRACE_LAUNCH") != null) std.debug.print("[triton] {s} grid=({d},{d},{d}) warps={d} shared={d}\n", .{ function, grid[0], grid[1], grid[2], v.spec.num_warps, v.spec.shared });
         try v.kernel.launchOn(.{ .x = grid[0], .y = grid[1], .z = grid[2] }, stream, &packed_args, .{}, &.{});
     }
 };

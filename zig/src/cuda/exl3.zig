@@ -39,6 +39,23 @@ pub fn plan(k: usize, n: usize, blocks: usize, min_tiles: usize) Plan {
     return .{ .sk = sk, .wk = wk };
 }
 
+/// Qwen3.8-27B teacher's per-shape split. Generic plan() picks a different (sk, wk) on these shapes.
+pub fn qwenPlan(halves: u16, k: usize, n: usize) Plan {
+    if (halves == 6) {
+        if (k == 17408 and n == 5120) return .{ .sk = 4, .wk = 2 };
+        if (k == 5120 and n == 10240) return .{ .sk = 2, .wk = 2 };
+        if (k == 5120 and n == 6144) return .{ .sk = 1, .wk = 8 };
+        if (k == 6144 and n == 5120) return .{ .sk = 4, .wk = 2 };
+    }
+    if (halves == 8) {
+        if (k == 17408 and n == 5120) return .{ .sk = 1, .wk = 8 };
+        if (k == 5120 and n == 10240) return .{ .sk = 5, .wk = 4 };
+        if (k == 5120 and n == 6144) return .{ .sk = 5, .wk = 2 };
+        if (k == 6144 and n == 5120) return .{ .sk = 16, .wk = 2 };
+    }
+    return plan(k, n, 192, 8);
+}
+
 const Sym = struct { k2: u16, cb: u8, wk: u8, name: [:0]const u8 };
 
 // exl3 linear: every instantiation the fatbin exports, as cuobjdump lists them (k2, codebook, warps).
@@ -63,6 +80,7 @@ const lin_syms = [_]Sym{
     .{ .k2 = 6, .cb = 0, .wk = 8, .name = "_ZN14tf_exl3_linear13linear_kernelILi6ELi0ELi8EEEvPK6__halfPKjxxS3_S3_PviPfPiiiii" },
     .{ .k2 = 6, .cb = 1, .wk = 4, .name = "_ZN14tf_exl3_linear13linear_kernelILi6ELi1ELi4EEEvPK6__halfPKjxxS3_S3_PviPfPiiiii" },
     .{ .k2 = 6, .cb = 1, .wk = 8, .name = "_ZN14tf_exl3_linear13linear_kernelILi6ELi1ELi8EEEvPK6__halfPKjxxS3_S3_PviPfPiiiii" },
+    .{ .k2 = 6, .cb = 2, .wk = 2, .name = "_ZN14tf_exl3_linear13linear_kernelILi6ELi2ELi2EEEvPK6__halfPKjxxS3_S3_PviPfPiiiii" },
     .{ .k2 = 6, .cb = 2, .wk = 4, .name = "_ZN14tf_exl3_linear13linear_kernelILi6ELi2ELi4EEEvPK6__halfPKjxxS3_S3_PviPfPiiiii" },
     .{ .k2 = 6, .cb = 2, .wk = 8, .name = "_ZN14tf_exl3_linear13linear_kernelILi6ELi2ELi8EEEvPK6__halfPKjxxS3_S3_PviPfPiiiii" },
     .{ .k2 = 7, .cb = 2, .wk = 4, .name = "_ZN14tf_exl3_linear13linear_kernelILi7ELi2ELi4EEEvPK6__halfPKjxxS3_S3_PviPfPiiiii" },
@@ -71,6 +89,7 @@ const lin_syms = [_]Sym{
     .{ .k2 = 8, .cb = 0, .wk = 8, .name = "_ZN14tf_exl3_linear13linear_kernelILi8ELi0ELi8EEEvPK6__halfPKjxxS3_S3_PviPfPiiiii" },
     .{ .k2 = 8, .cb = 1, .wk = 4, .name = "_ZN14tf_exl3_linear13linear_kernelILi8ELi1ELi4EEEvPK6__halfPKjxxS3_S3_PviPfPiiiii" },
     .{ .k2 = 8, .cb = 1, .wk = 8, .name = "_ZN14tf_exl3_linear13linear_kernelILi8ELi1ELi8EEEvPK6__halfPKjxxS3_S3_PviPfPiiiii" },
+    .{ .k2 = 8, .cb = 2, .wk = 2, .name = "_ZN14tf_exl3_linear13linear_kernelILi8ELi2ELi2EEEvPK6__halfPKjxxS3_S3_PviPfPiiiii" },
     .{ .k2 = 8, .cb = 2, .wk = 4, .name = "_ZN14tf_exl3_linear13linear_kernelILi8ELi2ELi4EEEvPK6__halfPKjxxS3_S3_PviPfPiiiii" },
     .{ .k2 = 8, .cb = 2, .wk = 8, .name = "_ZN14tf_exl3_linear13linear_kernelILi8ELi2ELi8EEEvPK6__halfPKjxxS3_S3_PviPfPiiiii" },
     .{ .k2 = 10, .cb = 0, .wk = 4, .name = "_ZN14tf_exl3_linear13linear_kernelILi10ELi0ELi4EEEvPK6__halfPKjxxS3_S3_PviPfPiiiii" },
@@ -310,6 +329,7 @@ pub const Weight = struct {
     n: usize,
     width: Width,
     codebook: Codebook,
+    fixed_plan: ?Plan = null,
 
     /// The stored layout's uint32 strides: (words between k tiles, words between 128-column blocks).
     pub fn strideK(w: Weight) usize {
@@ -321,7 +341,7 @@ pub const Weight = struct {
     }
 
     pub fn split(w: Weight) Plan {
-        return plan(w.k, w.n, 192, 8);
+        return w.fixed_plan orelse plan(w.k, w.n, 192, 8);
     }
 };
 
@@ -379,6 +399,31 @@ test "plan matches linear.py at the 27B's shapes" {
     p = plan(17408, 5120, 192, 8);
     try t.expectEqual(@as(u32, 8), p.sk);
     try t.expectEqual(@as(u32, 4), p.wk);
+}
+
+test "qwenPlan pins the 27B teacher's splits" {
+    const t = std.testing;
+    const rows = [_]struct { h: u16, k: usize, n: usize, sk: u32, wk: u32 }{
+        .{ .h = 6, .k = 17408, .n = 5120, .sk = 4, .wk = 2 },
+        .{ .h = 6, .k = 5120, .n = 10240, .sk = 2, .wk = 2 },
+        .{ .h = 6, .k = 5120, .n = 6144, .sk = 1, .wk = 8 },
+        .{ .h = 6, .k = 6144, .n = 5120, .sk = 4, .wk = 2 },
+        .{ .h = 8, .k = 17408, .n = 5120, .sk = 1, .wk = 8 },
+        .{ .h = 8, .k = 5120, .n = 10240, .sk = 5, .wk = 4 },
+        .{ .h = 8, .k = 5120, .n = 6144, .sk = 5, .wk = 2 },
+        .{ .h = 8, .k = 6144, .n = 5120, .sk = 16, .wk = 2 },
+    };
+    for (rows) |r| {
+        const p = qwenPlan(r.h, r.k, r.n);
+        try t.expectEqual(r.sk, p.sk);
+        try t.expectEqual(r.wk, p.wk);
+        const g = plan(r.k, r.n, 192, 8);
+        try t.expect(g.sk != p.sk or g.wk != p.wk);
+    }
+    const head = qwenPlan(6, 5120, 248320);
+    const generic = plan(5120, 248320, 192, 8);
+    try t.expectEqual(generic.sk, head.sk);
+    try t.expectEqual(generic.wk, head.wk);
 }
 
 test "every symbol table entry is unique" {

@@ -112,7 +112,8 @@ const Loader = struct {
 
     /// One scanned group uploaded as stored; the QLinear carries the launching module.
     fn group(L: *Loader, g: exl3.Group) !kern.QLinear {
-        const w = try exl3.upload(L.ops.k.d, L.arena, g);
+        var w = try exl3.upload(L.ops.k.d, L.arena, g);
+        w.fixed_plan = exl3.qwenPlan(w.width.halves, w.k, w.n);
         try L.w.buffers.append(L.gpa, w.trellis);
         try L.w.buffers.append(L.gpa, w.suh);
         try L.w.buffers.append(L.gpa, w.svh);

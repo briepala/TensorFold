@@ -73,6 +73,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
     own.* = .{ .gpa = gpa, .e = e, .lanes = try Lanes.init(gpa, e, most_streams) };
+    errdefer if (own.draft) |d| d.deinit();
     errdefer own.lanes.deinit();
     if (o.drafts) if (try drafterDir(gpa, io, o.drafter)) |draft_dir| {
         defer gpa.free(draft_dir);

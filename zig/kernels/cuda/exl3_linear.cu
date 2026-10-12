@@ -283,7 +283,7 @@ __global__ void __launch_bounds__(32) unpack_kernel(const uint32_t* __restrict__
 
 }  // namespace tf_exl3_linear
 
-// The instantiations the native runtime launches: every width of every codebook, WK 4 and 8, plus unpack.
+// WK 4 and 8 for every width, plus WK 2 for the 27B's 6- and 8-half mul1 plans.
 #define TF_EXL3_WIDTHS(X, CB) X(2, CB) X(4, CB) X(6, CB) X(8, CB) X(10, CB) X(12, CB) X(14, CB) X(16, CB)
 #define TF_EXL3_ALL(X) TF_EXL3_WIDTHS(X, 0) TF_EXL3_WIDTHS(X, 1) TF_EXL3_WIDTHS(X, 2) X(3, 2) X(5, 2) X(7, 2)
 
@@ -295,6 +295,12 @@ __global__ void __launch_bounds__(32) unpack_kernel(const uint32_t* __restrict__
         const half*, const uint32_t*, long long, long long, const half*, const half*, void*, int, float*, int*,    \
         int, int, int, int);
 TF_EXL3_ALL(TF_EXL3_KERNEL)
+template __global__ void tf_exl3_linear::linear_kernel<6, 2, 2>(
+    const half*, const uint32_t*, long long, long long, const half*, const half*, void*, int, float*, int*,
+    int, int, int, int);
+template __global__ void tf_exl3_linear::linear_kernel<8, 2, 2>(
+    const half*, const uint32_t*, long long, long long, const half*, const half*, void*, int, float*, int*,
+    int, int, int, int);
 
 #define TF_EXL3_UNPACK(K2, CB)                                                                                     \
     template __global__ void tf_exl3_linear::unpack_kernel<K2, CB>(const uint32_t*, half*, int, int64_t, int64_t);

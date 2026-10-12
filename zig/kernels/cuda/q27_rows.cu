@@ -98,7 +98,7 @@ __global__ void __launch_bounds__(32) gate_mul(const bf16* __restrict__ o, const
     group_sums(out + dst, xs + (size_t)row * (heads * d / 64) + head * (d / 64), d / 64);
 }
 
-// A bf16 embedding row gather: out = table[id] as stored (the EXL3 pack's plain table); ids are the engine's int32 rows.
+// A bf16 embedding row gather: out = table[id] as stored (the EXL3 pack's plain table); ids are int32 rows.
 __global__ void __launch_bounds__(32) b16_embed(const int* __restrict__ ids, const bf16* __restrict__ table,
                                                 bf16* __restrict__ out, int d) {
     const int row = blockIdx.x, lane = threadIdx.x;

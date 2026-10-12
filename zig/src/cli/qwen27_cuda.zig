@@ -81,7 +81,7 @@ pub fn main(init: std.process.Init) !u8 {
         const name = entry.key_ptr.*;
         const ids = try tokenList(arena, entry.value_ptr.*);
         if (o.dump) |dir| {
-            // run --dump DIR --cases NAME: that prompt's one pass alone, every norm's (h, y) rows as capture.py's prefill/<case>
+            // --dump DIR --cases NAME: that prompt's one pass, every norm's (h, y) rows as capture.py's prefill/<case>
             if (!std.mem.eql(u8, o.cases orelse "", name)) continue;
             try seq.reset(e.ops(), e.w.g);
             var f = e.forward();

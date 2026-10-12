@@ -139,7 +139,7 @@ pub const Backend = struct {
         b.vtable.release(b.ptr, s);
     }
 
-    /// A driver of its own starts a stream: the prompt pass and its first token, committed; a cancel or failure releases it.
+    /// A driver of its own starts a stream: prompt pass and first token, committed; a cancel or failure releases it.
     pub fn opening(b: Backend, gpa: std.mem.Allocator, s: *Stream) !u32 {
         errdefer b.release(s);
         try b.prefill(s);

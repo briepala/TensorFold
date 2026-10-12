@@ -10,7 +10,7 @@ const budget = @import("cuda_memory.zig");
 const nemotron_slide = @import("nemotron_slide.zig");
 
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
-const registry = .{ nemotron.native, qwen27.native };
+pub const registry = .{ nemotron.native, qwen27.native };
 
 /// Nemotron's prompt-cache copies. A file-level value so the store's pointer stays valid for the process.
 const nemotron_snaps: api.prompt_cache.Snapshots.VTable = .{
@@ -39,7 +39,7 @@ pub fn chip(a: Allocator) ?[]const u8 {
     return chipClass(a, driver.capability(@intCast(ordinal orelse 0)) catch return null);
 }
 
-fn chipClass(a: Allocator, capability: u32) ?[]const u8 {
+pub fn chipClass(a: Allocator, capability: u32) ?[]const u8 {
     return std.fmt.allocPrint(a, "nvidia-sm{d}", .{capability}) catch null;
 }
 
@@ -48,7 +48,7 @@ fn getenv(name: [:0]const u8) ?[]const u8 {
 }
 
 /// A variable's whole number: null when unset or empty, an error for anything else that is not one.
-fn envNumber(text: ?[]const u8) error{Invalid}!?u32 {
+pub fn envNumber(text: ?[]const u8) error{Invalid}!?u32 {
     const t = std.mem.trim(u8, text orelse return null, " ");
     if (t.len == 0) return null;
     return std.fmt.parseInt(u32, t, 10) catch error.Invalid;
@@ -76,7 +76,7 @@ fn modelContext(a: Allocator, io: std.Io, dir: []const u8) i64 {
 }
 
 /// Prompt plus reply tokens a request may use: --context (0: the model's window), else the family default within it.
-fn contextWindow(requested: ?i64, native: i64, default: i64) error{ Negative, NoNative, PastNative }!i64 {
+pub fn contextWindow(requested: ?i64, native: i64, default: i64) error{ Negative, NoNative, PastNative }!i64 {
     const r = requested orelse return if (native > 0) @min(default, native) else default;
     if (r < 0) return error.Negative;
     if (r == 0) return if (native > 0) native else error.NoNative;
@@ -134,7 +134,7 @@ threadlocal var bound: ?*const cuda.Context = null;
 const Gpu = struct { driver: cuda.Driver, ctx: cuda.Context };
 
 /// One loaded model behind the lane host: everything the engine thread reads lives here.
-const Host = struct {
+pub const Host = struct {
     gpa: Allocator,
     gpu: ?*Gpu, // null in host tests: no context to bind
     family: *anyopaque,
@@ -490,41 +490,12 @@ fn toGib(bytes: u64) f64 {
 
 test {
     _ = budget; // cuda_memory.zig's own tests, which no other test binary reaches
+    _ = @import("cuda_host_test.zig");
 }
 
 test "--learn is refused whatever the family, and --slide or a learned-disk size alone is not" {
     try std.testing.expectStringStartsWith(refusal(.{ .dir = "d", .model_type = "nemotron_h", .learn = "/x" }) orelse "", "--learn learns prompt prefixes on Macs only");
     try std.testing.expect(refusal(.{ .dir = "d", .model_type = "nemotron_h", .slide = true, .learn_gib = 8, .learn_min_free_gib = 2 }) == null);
-}
-
-test "chip classes name the compute capability as gate entries do" {
-    const a = std.testing.allocator;
-    const name = chipClass(a, 121).?;
-    defer a.free(name);
-    try std.testing.expectEqualStrings("nvidia-sm121", name);
-}
-
-test "every registered family is listed for capabilities" {
-    try std.testing.expectEqual(@as(usize, registry.len), families.len);
-    try std.testing.expectEqualStrings("nemotron_h", families[0].model_type);
-}
-
-test "variables: unset or empty means the default, anything but a whole number is refused" {
-    try std.testing.expectEqual(@as(?u32, null), try envNumber(null));
-    try std.testing.expectEqual(@as(?u32, null), try envNumber(""));
-    try std.testing.expectEqual(@as(?u32, 3), try envNumber(" 3"));
-    try std.testing.expectError(error.Invalid, envNumber("one"));
-    try std.testing.expectError(error.Invalid, envNumber("-1"));
-}
-
-test "context windows: the family default inside the model's, 0 for the model's, never past it" {
-    try std.testing.expectEqual(@as(i64, 16384), try contextWindow(null, 262144, 16384));
-    try std.testing.expectEqual(@as(i64, 4096), try contextWindow(null, 4096, 16384));
-    try std.testing.expectEqual(@as(i64, 262144), try contextWindow(0, 262144, 16384));
-    try std.testing.expectEqual(@as(i64, 65536), try contextWindow(65536, 262144, 16384));
-    try std.testing.expectError(error.PastNative, contextWindow(300000, 262144, 16384));
-    try std.testing.expectError(error.Negative, contextWindow(-5, 262144, 16384));
-    try std.testing.expectError(error.NoNative, contextWindow(0, 0, 16384));
 }
 
 test "a cancel during a long prompt stops it, and the next request's reply is unchanged (#291)" {

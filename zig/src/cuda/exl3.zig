@@ -17,7 +17,6 @@ pub const Group = format.Group;
 pub const scan = format.scan;
 
 /// (K splits, warps a program) for a K x N layer: linear.py's plan, the shape's alone.
-/// The launch plan a weight's shape fixes: K splits and warps a program.
 pub const Plan = struct { sk: u32, wk: u32 };
 
 pub fn plan(k: usize, n: usize, blocks: usize, min_tiles: usize) Plan {
@@ -156,8 +155,7 @@ pub const Linear = struct {
         return out;
     }
 
-    /// The same resolution over a module the caller loaded (and owns unloading of).
-    /// The caller owns `mod`'s lifetime: this Linear resolves functions from it and never unloads it.
+    /// The same resolution over a module the caller loaded and owns: this Linear never unloads it.
     pub fn fromModule(d: *const Driver, mod: *const Module) !Linear {
         var out: Linear = undefined;
         out.d = d;
@@ -273,8 +271,7 @@ pub const Linear = struct {
         }, s, &args);
     }
 
-    /// W_q [k, n] fp16 unpacked from the trellis, once a prompt chunk: unpack_kernel(T, W, N, stride_k, stride_nb),
-    /// one warp a 16x16 tile over grid (N/16, K/16), as exl3_unpack_cuda launches it (__launch_bounds__(32)).
+    /// W_q [k, n] fp16 unpacked from the trellis, once a prompt chunk: one warp a 16x16 tile over (N/16, K/16).
     pub fn unpackPtr(l: *const Linear, s: stream_.Stream, w: Weight, out: u64) !void {
         const f = try l.unpackFn(w.width.halves, w.codebook);
         var args = launch.Args{};

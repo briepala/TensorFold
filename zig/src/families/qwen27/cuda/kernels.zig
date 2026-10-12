@@ -45,9 +45,7 @@ pub const pattn_smem: u32 = 98304; // two 32-key slots of 256 dims beside eight 
 /// One item of a batched copy: 16-byte aligned pointers, a multiple of 16 bytes.
 pub const Copy = extern struct { dst: u64, src: u64, bytes: u64 };
 
-/// A tiled 4-bit projection: packed words, (kg, npad) scales and biases, n outputs from k inputs.
-/// One projection in whichever format holds it. `affine4` is the MLX lane layout byte-identical
-/// to before (the sm_12x path); `exl3` is a trellis weight; `b16` is unquantized bf16 rows.
+/// One projection in whichever format holds it: `affine4` the MLX layout, `exl3` a trellis, `b16` bf16 rows.
 pub const QLinear = union(enum) {
     affine4: Affine4,
     exl3: Exl3W,
@@ -120,7 +118,6 @@ pub const Kernels = struct {
         const kk = cuda.kernels;
         const images = [_][]const u8{ kk.qmm_group, kk.qmm_prefill, kk.lane_gemv, kk.prefill_attention, kk.gdn, kk.gdn_prefill, kk.nemotron_ops, kk.torch_argmax, kk.torch_topk, kk.torch_pointwise, kk.torch_indexing, kk.torch_movement, kk.torch_nemotron_constants, kk.qwen_ops, kk.torch_norm_rotary };
         // the sm_86 additions load best-effort: an EXL3 pack needs them, an MLX pack never touches them.
-        // Fixed slots past the 15 base images: 15 exl3_linear, 16 b16, 17 q27_rows.
         var loaded_extra: usize = 0;
         if (cuda.Module.load(d, kk.exl3_linear)) |m| {
             k.mods[15] = m;
@@ -302,7 +299,6 @@ pub const Ops = struct {
     }
 
     /// b16 rows: a warp a column over R rows (R by row count: 1, 4, 16), fp16 or bf16 weights.
-    /// An fp16 weight reads x cast to fp16 and writes fp16 rows, as b16.matmul's x.to(w.dtype) does.
     fn b16Rows(o: Ops, x: u64, b: B16W, out: u64, rows: usize) !void {
         const i: usize = if (rows <= 1) 0 else if (rows <= 4) 1 else 2;
         const r: usize = switch (i) { 0 => 1, 1 => 4, else => 16 };

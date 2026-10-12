@@ -1,6 +1,4 @@
-//! DFlash2's drafter the way the Python engine held it on sm_86 (fast=False): projections bf16 on the
-//! GPU behind the b16 row/prompt kernels, codebooks fp32 on the host. Only the head's tail span stays
-//! affine4-tiled, read off the target's quantized lm_head so its rows match the first span's own source.
+//! DFlash2's drafter as the Python engine held it on sm_86 (fast=False): bf16 projections, fp32 codebooks.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -124,9 +122,7 @@ const Loader = struct {
         return q;
     }
 
-    /// One bf16 (n, k) checkpoint tensor (or several stacked by rows) uploaded as-is: the b16 kernels'
-    /// (n, k) row-major weight, no quantization, ops.dense's .b16 path. K a multiple of 64 for the
-    /// prompt kernel's stages; every part's upload offset a multiple of k*2 bytes (16-byte aligned).
+    /// One bf16 (n, k) tensor, or several stacked by rows, uploaded as-is: the b16 kernels' row-major weight.
     fn b16(L: *Loader, parts: []const Tensor, k: usize) !QLinear {
         if (k % 64 != 0) return error.UnexpectedDraftTensor;
         var n: usize = 0;
@@ -200,9 +196,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
     w.pred = try L.codebook(try ck.get("candidate_selector.predecessor_codebook"));
     w.succ = try L.codebook(try ck.get("candidate_selector.successor_codebook"));
     if (ck.unused() != 0) return error.UnusedDraftTensors;
-    // dflash2's sub-head: an MLX-pack target ships language_model.lm_head.{weight,scales,biases} and
-    // the tail span tiles off them. An EXL3 target has a trellis lm_head instead — those tensors do
-    // not exist — and the drafter reads both spans off the target head's own matmul (draft.zig).
+    // dflash2's sub-head: an MLX target tiles the tail span off language_model.lm_head; an EXL3 target has none.
     {
         var tk = try core.Checkpoint.openModelPrefix(gpa, io, target_dir, "language_model.lm_head");
         defer tk.close();

@@ -1,5 +1,4 @@
-//! EXL3 dispatch and the b16 path for the 27B's Ops: dense projections by weight format, the
-//! trellis GEMV's scratch (xh, split-K partials), and the prompt path's W_q workspace.
+//! EXL3 dispatch and the b16 path for the 27B: dense projections by weight format, plus the GEMV scratch.
 
 const std = @import("std");
 const cuda = @import("cuda");

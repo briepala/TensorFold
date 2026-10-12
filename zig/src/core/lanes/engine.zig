@@ -107,7 +107,7 @@ pub const Engine = struct {
         try e.live.append(e.gpa, s);
     }
 
-    /// Take over a stream another driver decoded so far: its cache settled, `pending` and `cache_len` set, no drafts held.
+    /// Take over a stream another driver decoded: its cache settled, `pending` and `cache_len` set, no drafts held.
     pub fn adopt(e: *Engine, s: *Stream) !void {
         try e.live.append(e.gpa, s);
     }

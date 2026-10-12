@@ -1,7 +1,4 @@
-//! The 27B's EXL3 weights on the GPU, filling the family's shared Weights: the pack scanned once
-//! (every group's width, codebook and scales derived as the format specifies), trellis groups
-//! uploaded as stored, bf16 norms and the bf16 embedding table. Projections are `.exl3` QLinears,
-//! so the engine, forward, lanes and drafter stay format-blind.
+//! The 27B's EXL3 weights on the GPU, filling the family's shared Weights: the pack scanned once.
 
 const std = @import("std");
 const cuda = @import("cuda");

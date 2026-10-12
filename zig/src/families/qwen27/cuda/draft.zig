@@ -397,10 +397,7 @@ pub const DFlash2 = struct {
         try x.t.groupSums(x.head_h, x.xs, H, total, H);
         const head = tw.head;
         if (head == .exl3) {
-            // An EXL3 target's head is a trellis group whose strip order is the vocab: one matmul over
-            // the whole head, then both spans gather off it by row (the strip layout keeps rows
-            // contiguous, so the copies are plain row slices). Python's _exl3_sub_head, minus the
-            // strips it can skip: the whole 248,320-column head costs one extra launch's worth.
+            // An EXL3 head is one trellis matmul over the whole vocab; both spans then gather off it by row.
             try x.ops.denseSplit(x.head_h, x.xs, head, x.logits32full, total, 1);
             var items: std.ArrayList(kern.Copy) = .empty;
             defer items.deinit(x.gpa);

@@ -89,7 +89,7 @@ pub fn treeVariant(slots: u32, streams: u32, major: c_int, minor: c_int, sms: c_
 /// The exl3_linear image's mangled names (namespace tf_exl3_linear), from cuobjdump of the sm_86 build.
 pub const exl3_symbols = struct {
     pub const rot_in = "_ZN14tf_exl3_linear13rot_in_kernelEPKviPK6__halfPS2_i";
-    /// linear_kernel<K2, CB, WK>: K2 in {2,3,4,5,6,8,10,12,14,16}, CB 0-2, WK 4 or 8; the template args are in the name.
+    /// linear_kernel<K2, CB, WK>: K2 in {2,3,4,5,6,8,10,12,14,16}, CB 0-2, WK 4 or 8; the args are in the name.
     pub const linear_prefix = "_ZN14tf_exl3_linear13linear_kernelI";
     /// unpack_kernel<K2, CB>: K2 in {2,3,4,5,6,7,8,10,12,14,16}, CB 0-2.
     pub const unpack_prefix = "_ZN14tf_exl3_linear13unpack_kernelI";

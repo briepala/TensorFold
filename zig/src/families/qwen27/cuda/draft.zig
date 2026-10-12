@@ -18,6 +18,8 @@ const D = dl.head_dim;
 pub const block = 16; // masked rows a round drafts at most (dflash2.block)
 /// Block rows a batch takes: every stream's block in one forward (launch_blocks).
 pub const most_rows = block * st.max_streams;
+/// An EXL3 target's whole-vocab head rows (draft.zig's one-matmul span gather).
+pub const vocab_full = 248320;
 /// Copy items a batch takes: every layer's keys and values of every stream, two pieces a head (or the head's rows).
 const most_copies = @max(dl.layers * st.max_streams * 2 * dl.kv_heads * 2, 2 * most_rows);
 
@@ -89,6 +91,7 @@ pub const DFlash2 = struct {
     logits: u64,
     logits_tail: u64,
     logits32: u64,
+    logits32full: u64 = 0, // an EXL3 target head's whole-vocab logits (bf16) the spans gather off
     cand_values: u64,
     cand_ids: u64,
     topk_scratch: u64,
@@ -146,6 +149,7 @@ pub const DFlash2 = struct {
             x.logits = try A.take(W * dl.head_rows * bf);
             x.logits_tail = try A.take(W * (dl.spans[1][1] - dl.spans[1][0]) * bf);
             x.logits32 = try A.take(W * dl.head_rows * 4);
+            x.logits32full = try A.take(W * vocab_full * bf);
             x.cand_values = try A.take(W * policy.top * 4);
             x.cand_ids = try A.take(W * policy.top * 8);
             x.topk_scratch = try A.take(kern.torch_ops.topkScratchBytes(W, dl.head_rows));
@@ -392,24 +396,43 @@ pub const DFlash2 = struct {
         // matmul_rows: the head's spans at the stacked rows' K split (1), then joined column-wise
         try x.t.groupSums(x.head_h, x.xs, H, total, H);
         const head = tw.head;
-        // the head's first span: the same weight with n cut to the span (row views make this free)
-        const first: kern.QLinear = switch (head) {
-            .affine4 => |a| .{ .affine4 = .{ .w = a.w, .s = a.s, .b = a.b, .n = dl.spans[0][1], .k = a.k, .npad = a.npad } },
-            .exl3 => |e| .{ .exl3 = e },   // the trellis head serves both spans by column block in one launch
-            .b16 => |b| .{ .b16 = .{ .w = b.w, .n = dl.spans[0][1], .k = b.k } },
-        };
-        try x.ops.denseSplit(x.head_h, x.xs, first, x.logits32, total, 1); // a scratch of the right size
-        try x.ops.denseSplit(x.head_h, x.xs, x.w.head_tail, x.logits_tail, total, 1);
-        var items: std.ArrayList(kern.Copy) = .empty;
-        defer items.deinit(x.gpa);
-        const na = dl.spans[0][1];
-        const nb = dl.spans[1][1] - dl.spans[1][0];
-        for (0..total) |r| {
-            try items.append(x.gpa, .{ .dst = x.logits + r * dl.head_rows * bf, .src = x.logits32 + r * na * bf, .bytes = na * bf });
-            try items.append(x.gpa, .{ .dst = x.logits + (r * dl.head_rows + na) * bf, .src = x.logits_tail + r * nb * bf, .bytes = nb * bf });
+        if (head == .exl3) {
+            // An EXL3 target's head is a trellis group whose strip order is the vocab: one matmul over
+            // the whole head, then both spans gather off it by row (the strip layout keeps rows
+            // contiguous, so the copies are plain row slices). Python's _exl3_sub_head, minus the
+            // strips it can skip: the whole 248,320-column head costs one extra launch's worth.
+            try x.ops.denseSplit(x.head_h, x.xs, head, x.logits32full, total, 1);
+            var items: std.ArrayList(kern.Copy) = .empty;
+            defer items.deinit(x.gpa);
+            const na = dl.spans[0][1];
+            const nb = dl.spans[1][1] - dl.spans[1][0];
+            const off = dl.spans[1][0];
+            for (0..total) |r| {
+                try items.append(x.gpa, .{ .dst = x.logits + r * dl.head_rows * bf, .src = x.logits32full + r * vocab_full * bf, .bytes = na * bf });
+                try items.append(x.gpa, .{ .dst = x.logits + (r * dl.head_rows + na) * bf, .src = x.logits32full + (r * vocab_full + off) * bf, .bytes = nb * bf });
+            }
+            try x.ops.upload(x.copies, std.mem.sliceAsBytes(items.items));
+            try x.ops.copies(x.copies, items.items.len);
+        } else {
+            // the head's first span: the same weight with n cut to the span (row views make this free)
+            const first: kern.QLinear = switch (head) {
+                .affine4 => |a| .{ .affine4 = .{ .w = a.w, .s = a.s, .b = a.b, .n = dl.spans[0][1], .k = a.k, .npad = a.npad } },
+                .b16 => |b| .{ .b16 = .{ .w = b.w, .n = dl.spans[0][1], .k = b.k } },
+                .exl3 => unreachable,
+            };
+            try x.ops.denseSplit(x.head_h, x.xs, first, x.logits32, total, 1); // a scratch of the right size
+            try x.ops.denseSplit(x.head_h, x.xs, x.w.head_tail, x.logits_tail, total, 1);
+            var items: std.ArrayList(kern.Copy) = .empty;
+            defer items.deinit(x.gpa);
+            const na = dl.spans[0][1];
+            const nb = dl.spans[1][1] - dl.spans[1][0];
+            for (0..total) |r| {
+                try items.append(x.gpa, .{ .dst = x.logits + r * dl.head_rows * bf, .src = x.logits32 + r * na * bf, .bytes = na * bf });
+                try items.append(x.gpa, .{ .dst = x.logits + (r * dl.head_rows + na) * bf, .src = x.logits_tail + r * nb * bf, .bytes = nb * bf });
+            }
+            try x.ops.upload(x.copies, std.mem.sliceAsBytes(items.items));
+            try x.ops.copies(x.copies, items.items.len);
         }
-        try x.ops.upload(x.copies, std.mem.sliceAsBytes(items.items));
-        try x.ops.copies(x.copies, items.items.len);
         const torch = x.ops.torch();
         try torch.toF32(x.logits, x.logits32, total * dl.head_rows);
         try torch.topk(x.logits32, dl.head_rows, total, policy.top, x.cand_values, x.cand_ids, x.topk_scratch);
@@ -417,6 +440,7 @@ pub const DFlash2 = struct {
         try x.ops.download(std.mem.sliceAsBytes(x.host_ids[0 .. total * policy.top]), x.cand_ids);
         try x.ops.download(std.mem.sliceAsBytes(x.host_selected[0 .. total * dl.selector_rank]), x.selected);
         try x.ops.s.synchronize();
+        const na = dl.spans[0][1];
         for (0..total * policy.top) |j| {
             const local: usize = @intCast(x.host_ids[j]);
             x.cands[j] = @intCast(if (local < na) local else dl.spans[1][0] + local - na);

@@ -200,12 +200,18 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
     w.pred = try L.codebook(try ck.get("candidate_selector.predecessor_codebook"));
     w.succ = try L.codebook(try ck.get("candidate_selector.successor_codebook"));
     if (ck.unused() != 0) return error.UnusedDraftTensors;
-    // dflash2's sub-head: rows() of the tiled head copies a span off the 64-row tile grid, packed on its own
-    var tk = try core.Checkpoint.openModelPrefix(gpa, io, target_dir, "language_model.lm_head");
-    defer tk.close();
-    const hw = try tk.get("language_model.lm_head.weight");
-    const hs = try tk.get("language_model.lm_head.scales");
-    const hb = try tk.get("language_model.lm_head.biases");
+    // dflash2's sub-head: an MLX-pack target ships language_model.lm_head.{weight,scales,biases} and
+    // the tail span tiles off them. An EXL3 target has a trellis lm_head instead — those tensors do
+    // not exist — and the drafter reads both spans off the target head's own matmul (draft.zig).
+    {
+        var tk = try core.Checkpoint.openModelPrefix(gpa, io, target_dir, "language_model.lm_head");
+        defer tk.close();
+        const hw = tk.get("language_model.lm_head.weight") catch |e| switch (e) {
+            error.MissingTensor => return w, // EXL3 target: head_tail stays unused
+            else => return e,
+        };
+        const hs = try tk.get("language_model.lm_head.scales");
+        const hb = try tk.get("language_model.lm_head.biases");
     const a = spans[1][0];
     const n = spans[1][1] - a;
     const k8 = hidden / 8;
@@ -218,6 +224,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
     @memcpy(std.mem.sliceAsBytes(L.scales.items), hs.bytes[a * kg * 2 ..][0 .. n * kg * 2]);
     @memcpy(std.mem.sliceAsBytes(L.biases.items), hb.bytes[a * kg * 2 ..][0 .. n * kg * 2]);
     w.head_tail = try L.tile(L.words.items, L.scales.items, L.biases.items, n, hidden);
+    }
     return w;
 }
 

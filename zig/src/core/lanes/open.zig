@@ -25,6 +25,16 @@ pub fn add(e: *Engine, s: *Stream) !void {
 
 /// After the prompt pass: the first token drawn and committed, the first drafts asked; rounds from the next.
 pub fn opened(e: *Engine, s: *Stream) !void {
+    const o = try opening(e, s);
+    if (o.asked) |d| try e.backend.draft(&.{draftRequest(s, o.feed, d)});
+    try joined(e, s, o);
+}
+
+/// What a stream's first token leaves for its first drafts: the feed, the draw's handle, the depth asked (null: none).
+pub const Opening = struct { feed: Feed, drawn: u64, asked: ?u32 };
+
+/// The first token drawn (or forced) at the prompt's end, then its next draw queued or its first drafts' depth chosen.
+pub fn opening(e: *Engine, s: *Stream) !Opening {
     if (s.isCancelled()) { // cancelled in its last chunk: no first token
         e.backend.release(s);
         return error.Cancelled;
@@ -40,22 +50,33 @@ pub fn opened(e: *Engine, s: *Stream) !void {
     var asked: ?u32 = null;
     if (e.cfg.family_mtp and s.drafts) {
         // the head reads the prompt's last row and the first token, and drafts the one after it
-        const d: u32 = @intCast(try e.rule.depth(win.who(s)));
-        asked = d;
-        try e.backend.draft(&.{.{ .stream = s, .follow = &.{}, .first = feed, .rows = null, .start = s.prompt_len, .position = position + 1, .depth = d }});
+        asked = @intCast(try e.rule.depth(win.who(s)));
+    } else if (e.cfg.pipelined and s.logprobs == null and s.grammar == null) {
+        try e.queueNext(s, feed);
+    }
+    return .{ .feed = feed, .drawn = drawn, .asked = asked };
+}
+
+/// The head's request for a stream's first drafts, `d` deep after the first token.
+pub fn draftRequest(s: *Stream, feed: Feed, d: u32) be.DraftRequest {
+    return .{ .stream = s, .follow = &.{}, .first = feed, .rows = null, .start = s.prompt_len, .position = s.prompt_len + 1, .depth = d };
+}
+
+/// Once the first drafts are asked: the first token committed, the stream live (or finished) from the next round.
+pub fn joined(e: *Engine, s: *Stream, o: Opening) !void {
+    const position: u64 = s.prompt_len;
+    if (o.asked) |d| {
         s.dropHeld(e.gpa);
         s.next = .{ .count = d };
         if (e.backend.vtable.tree) |tree| if (try tree(e.backend.ptr, s, e.gpa)) |held| {
             s.next = held; // a tree head's first drafts as host tokens, as every later round's
         };
-    } else if (e.cfg.pipelined and s.logprobs == null and s.grammar == null) {
-        try e.queueNext(s, feed);
     }
-    const value = try e.readFeed(feed);
-    if (asked) |d| try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(d)), f("position", int(position + 1)), f("follow", .{ .u32s = &.{value} }), f("rows", .null) });
+    const value = try e.readFeed(o.feed);
+    if (o.asked) |d| try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(d)), f("position", int(position + 1)), f("follow", .{ .u32s = &.{value} }), f("rows", .null) });
     if (e.log != null) {
-        const first = if (feed == .handle) value else try e.backend.read(drawn);
-        try trail.event(e, &.{ f("ev", str("first")), f("stream", str(s.id)), f("position", int(position)), f("drawn", int(first)), f("token", int(value)) });
+        const drawn = if (o.feed == .handle) value else try e.backend.read(o.drawn);
+        try trail.event(e, &.{ f("ev", str("first")), f("stream", str(s.id)), f("position", int(position)), f("drawn", int(drawn)), f("token", int(value)) });
     }
     var first_row: [1]LogRow = undefined;
     if (s.logprobs != null) first_row[0] = (try e.backend.firstRow(s)).forToken(value);

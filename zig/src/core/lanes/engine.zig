@@ -13,6 +13,7 @@ const plan_lanes = @import("plan_lanes.zig");
 const fill = @import("fill.zig");
 const trail = @import("trail.zig");
 const open = @import("open.zig");
+const admit = @import("admit.zig");
 const Stream = sm.Stream;
 const Feed = be.Feed;
 const LogRow = @import("logprob.zig").Row;
@@ -81,6 +82,30 @@ pub const Engine = struct {
     pub const opened = open.opened;
     pub const fills = open.fills;
     pub const fillStream = open.fillStream;
+    pub const addStreams = admit.streams;
+    pub const together = admit.together;
+
+    /// A stream another driver prefilled and drew `token` for: drafts asked, the token committed, rounds from here.
+    pub fn adoptPrefilled(e: *Engine, s: *Stream, token: u32) !void {
+        _ = e.arena.reset(.retain_capacity);
+        s.context.shrinkRetainingCapacity(s.prompt_len);
+        s.pending = null;
+        s.cache_len = s.prompt_len;
+        if (e.cfg.family_mtp and s.drafts) {
+            const d: u32 = @intCast(try e.rule.depth(win.who(s)));
+            try e.backend.draft(&.{.{ .stream = s, .follow = &.{}, .first = .{ .value = token }, .rows = null, .start = s.prompt_len, .position = s.prompt_len + 1, .depth = d }});
+            s.dropHeld(e.gpa);
+            s.next = .{ .count = d };
+            if (e.backend.vtable.tree) |tree| if (try tree(e.backend.ptr, s, e.gpa)) |held| {
+                s.next = held;
+            };
+        }
+        if (s.logprobs != null) return error.LogprobsUnsupported; // another driver's prompt pass gives no first row
+        _ = try s.commit(e.gpa, &.{token}, &.{});
+        s.pending = token;
+        if (s.finished) return e.release(s);
+        try e.live.append(e.gpa, s);
+    }
 
     /// Take over a stream another driver decoded so far: its cache settled, `pending` and `cache_len` set, no drafts held.
     pub fn adopt(e: *Engine, s: *Stream) !void {

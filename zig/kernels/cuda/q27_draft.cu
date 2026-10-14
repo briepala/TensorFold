@@ -37,7 +37,7 @@ __device__ void dprep_pair(const bf16* src, const bf16* norm, const float* cos, 
     const float b = tf_glue::rbf(__fmul_rn(__fmul_rn(tf_glue::bf(src[half + i]), inv_b), tf_glue::bf(norm[half + i])));
     const float cs = cos[(size_t)row * half + i];
     const float sn = sin[(size_t)row * half + i];
-    dst[i] = __float2bfloat16_rn(__fmaf_rn(a, cs, -__fmul_rn(b, sn)));
+    dst[i] = __float2bfloat16_rn(__fmaf_rn(-b, sn, __fmul_rn(a, cs)));
     dst[half + i] = __float2bfloat16_rn(__fmaf_rn(b, cs, __fmul_rn(a, sn)));
 }
 

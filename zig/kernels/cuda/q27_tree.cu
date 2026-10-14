@@ -27,6 +27,7 @@ __device__ Acc acc_new() {
     return a;
 }
 
+// Sequential f32 dots; Triton's tl.dot is HMMA.16816.F32.BF16 (docs/q27-sm86-hmma.md).
 __device__ void tile_rows(const bf16* q, const bf16* kbuf, const bf16* vbuf, Acc& a, const int* valid, float scale, int d) {
     const int lane = threadIdx.x & 31;
     const bool v1 = valid[lane] != 0, v2 = valid[32 + lane] != 0;

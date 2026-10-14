@@ -190,7 +190,8 @@ pub const Glue = struct {
         a.add(i(mrope_rows));
         a.add(i(hsec));
         a.add(i(wsec));
-        try g.go(g.f.attn_prep, .{ rows, shape.heads + shape.kv_heads, 1 }, 1, 0, &a);
+        const block: u32 = if (shape.dim == 256) 64 else 1; // captured _attn_prep is two warps at D=256
+        try g.go(g.f.attn_prep, .{ rows, shape.heads + shape.kv_heads, 1 }, block, 0, &a);
     }
 
     pub fn gateMul(g: Glue, o: u64, qg: u64, out: u64, xs: u64, rows: usize, heads: usize, dim: usize) !void {

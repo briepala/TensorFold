@@ -336,6 +336,20 @@ pub fn gdnPre(qkv: []const u16, cs: []const u16, cw: []const u16, win: []const i
     }
 }
 
+fn attnAxis(freq: usize, mrope_rows: usize, hsec: usize, wsec: usize) usize {
+    if (mrope_rows == 0) return 0;
+    const sec = freq % 3;
+    if (sec == 1 and freq < 3 * hsec) return 1;
+    if (sec == 2 and freq < 3 * wsec) return 2;
+    return 0;
+}
+
+fn attnRotate(xn: []const f32, i: usize, half: usize, cs: f32, sn: f32) f32 {
+    @setFloatMode(.strict);
+    const pn = xn[if (i < half) i + half else i - half];
+    return if (i < half) (xn[i] * cs) - (pn * sn) else (xn[i] * cs) + (pn * sn);
+}
+
 pub fn attnPrep(qg: []const u16, kv: []const u16, qn: []const u16, kn: []const u16, pos: []const i32, invf: []const f32, qo: []u16, ko: []u16, rows: usize, h: usize, hkv: usize, d: usize, half: usize, eps: f32, mrope_rows: usize, hsec: usize, wsec: usize) void {
     @setFloatMode(.strict);
     if (d > 256) return;
@@ -346,28 +360,44 @@ pub fn attnPrep(qg: []const u16, kv: []const u16, qn: []const u16, kn: []const u
             const src = if (is_q) qg[(row * h + hd) * 2 * d ..][0..d] else kv[(row * hkv + hd) * d ..][0..d];
             const norm = if (is_q) qn else kn;
             const dst = if (is_q) qo[(row * h + hd) * d ..][0..d] else ko[(row * hkv + hd) * d ..][0..d];
-            var ss: f32 = 0;
-            for (0..d) |i| ss = gm.fma(bf(src[i]), bf(src[i]), ss);
-            const inv = mu.invRmsApprox(ss, d, eps);
+            var inv: f32 = undefined;
+            if (d == 256) {
+                var part: [64]f32 = undefined;
+                for (0..64) |tid| {
+                    const b = tid * 4;
+                    const p0 = gm.fma(bf(src[b + 1]), bf(src[b + 1]), bf(src[b]) * bf(src[b]));
+                    const p1 = gm.fma(bf(src[b + 3]), bf(src[b + 3]), bf(src[b + 2]) * bf(src[b + 2]));
+                    part[tid] = p0 + p1;
+                }
+                var w0: [32]f32 = undefined;
+                var w1: [32]f32 = undefined;
+                for (0..32) |i| {
+                    w0[i] = part[i];
+                    w1[i] = part[i + 32];
+                }
+                bfly32(&w0);
+                bfly32(&w1);
+                inv = mu.invRmsApprox(w0[0] + w1[0], 256, eps);
+            } else {
+                var ss: f32 = 0;
+                for (0..d) |i| ss = gm.fma(bf(src[i]), bf(src[i]), ss);
+                inv = mu.invRmsApprox(ss, d, eps);
+            }
             var xn: [256]f32 = undefined;
             for (0..d) |i| xn[i] = gm.rbf((bf(src[i]) * inv) * bf(norm[i]));
             for (0..d) |i| {
                 var out = xn[i];
                 if (i < 2 * half) {
                     const freq = if (i < half) i else i - half;
-                    var axis: usize = 0;
-                    if (mrope_rows > 0) {
-                        const sec = freq % 3;
-                        if (sec == 1 and freq < 3 * hsec) axis = 1;
-                        if (sec == 2 and freq < 3 * wsec) axis = 2;
-                    }
-                    const pr = if (mrope_rows > 0) pos[axis * mrope_rows + row] else pos[row];
+                    const pr = if (mrope_rows > 0) pos[attnAxis(freq, mrope_rows, hsec, wsec) * mrope_rows + row] else pos[row];
                     const ang = @as(f32, @floatFromInt(pr)) * invf[freq];
                     var sn: f32 = 0;
                     var cs: f32 = 0;
-                    m.sincos(ang, &sn, &cs);
-                    const pn = xn[if (i < half) i + half else i - half];
-                    out = if (i < half) (xn[i] * cs) - (pn * sn) else (xn[i] * cs) + (pn * sn);
+                    if (d == 256) {
+                        sn = m.nvSinf(ang);
+                        cs = m.nvCosf(ang);
+                    } else m.sincos(ang, &sn, &cs);
+                    out = attnRotate(&xn, i, half, cs, sn);
                 }
                 dst[i] = store(gm.rbf(out));
             }

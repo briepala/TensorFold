@@ -8,6 +8,9 @@
 
 using bf16 = __nv_bfloat16;
 
+extern "C" __device__ float __nv_sinf(float);
+extern "C" __device__ float __nv_cosf(float);
+
 __device__ float ab_f32(const void* p, int i, int f16) {
     if (f16) return __half2float(reinterpret_cast<const __half*>(p)[i]);
     return tf_glue::bf(reinterpret_cast<const bf16*>(p)[i]);
@@ -84,18 +87,60 @@ extern "C" __global__ void tf_q27_gdn_pre(const bf16* __restrict__ qkv, const bf
     }
 }
 
+__device__ int attn_axis(int freq, int mrope_rows, int hsec, int wsec) {
+    if (mrope_rows <= 0) return 0;
+    const int sec = freq % 3;
+    if (sec == 1 && freq < 3 * hsec) return 1;
+    if (sec == 2 && freq < 3 * wsec) return 2;
+    return 0;
+}
+
+__device__ float attn_rotate(float x, float p, float cs, float sn, int lo) {
+    return lo ? __fsub_rn(__fmul_rn(x, cs), __fmul_rn(p, sn)) : __fadd_rn(__fmul_rn(x, cs), __fmul_rn(p, sn));
+}
+
 // RMS then rotate-half. pos is int32. mrope_rows > 0 reads three coordinates at axis * mrope_rows + row.
 extern "C" __global__ void tf_q27_attn_prep(const bf16* __restrict__ qg, const bf16* __restrict__ kv, const bf16* __restrict__ qn,
                                             const bf16* __restrict__ kn, const int* __restrict__ pos, const float* __restrict__ invf,
                                             bf16* __restrict__ qo, bf16* __restrict__ ko, float eps, int h, int hkv, int d, int half,
                                             int mrope_rows, int hsec, int wsec) {
-    if (threadIdx.x != 0 || d > 256) return;
     const int row = blockIdx.x, head = blockIdx.y;
     const bool is_q = head < h;
     const int hd = is_q ? head : head - h;
     const bf16* src = is_q ? qg + ((size_t)row * h + hd) * 2 * d : kv + ((size_t)row * hkv + hd) * d;
     const bf16* norm = is_q ? qn : kn;
     bf16* dst = is_q ? qo + ((size_t)row * h + hd) * d : ko + ((size_t)row * hkv + hd) * d;
+    if (d == 256) {
+        __shared__ float ws[2];
+        const int tid = threadIdx.x;
+        if (tid >= 64) return;
+        const int i0 = tid * 4;
+        const float e0 = tf_glue::bf(src[i0]), e1 = tf_glue::bf(src[i0 + 1]);
+        const float e2 = tf_glue::bf(src[i0 + 2]), e3 = tf_glue::bf(src[i0 + 3]);
+        const float p0 = __fmaf_rn(e1, e1, __fmul_rn(e0, e0));
+        const float p1 = __fmaf_rn(e3, e3, __fmul_rn(e2, e2));
+        const float part = tf_q27m::bfly32(__fadd_rn(p0, p1));
+        if ((tid & 31) == 0) ws[tid >> 5] = part;
+        __syncthreads();
+        const float inv = tf_q27m::mufu_inv_rms(__fadd_rn(ws[0], ws[1]), 256, eps);
+        float xn[4];
+        for (int k = 0; k < 4; ++k) xn[k] = tf_glue::rbf(__fmul_rn(__fmul_rn(tf_glue::bf(src[i0 + k]), inv), tf_glue::bf(norm[i0 + k])));
+        for (int k = 0; k < 4; ++k) {
+            const int i = i0 + k;
+            float out = xn[k];
+            if (i < 2 * half) {
+                const int freq = i < half ? i : i - half;
+                const int pr = mrope_rows > 0 ? pos[attn_axis(freq, mrope_rows, hsec, wsec) * mrope_rows + row] : pos[row];
+                const float ang = __fmul_rn(static_cast<float>(pr), invf[freq]);
+                const int pi = i < half ? i + half : i - half;
+                const float pn = tf_glue::rbf(__fmul_rn(__fmul_rn(tf_glue::bf(src[pi]), inv), tf_glue::bf(norm[pi])));
+                out = attn_rotate(xn[k], pn, __nv_cosf(ang), __nv_sinf(ang), i < half);
+            }
+            dst[i] = __float2bfloat16_rn(tf_glue::rbf(out));
+        }
+        return;
+    }
+    if (threadIdx.x != 0 || d > 256) return;
     float ss = 0.f;
     for (int i = 0; i < d; ++i) {
         const float xv = tf_glue::bf(src[i]);
@@ -108,18 +153,11 @@ extern "C" __global__ void tf_q27_attn_prep(const bf16* __restrict__ qg, const b
         float out = xn[i];
         if (i < 2 * half) {
             const int freq = i < half ? i : i - half;
-            int axis = 0;
-            if (mrope_rows > 0) {
-                const int sec = freq % 3;
-                if (sec == 1 && freq < 3 * hsec) axis = 1;
-                if (sec == 2 && freq < 3 * wsec) axis = 2;
-            }
-            const int pr = mrope_rows > 0 ? pos[axis * mrope_rows + row] : pos[row];
+            const int pr = mrope_rows > 0 ? pos[attn_axis(freq, mrope_rows, hsec, wsec) * mrope_rows + row] : pos[row];
             const float ang = __fmul_rn(static_cast<float>(pr), invf[freq]);
             float sn, cs;
             tf_q27m::sincos(ang, sn, cs);
-            const float pn = xn[i < half ? i + half : i - half];
-            out = i < half ? __fsub_rn(__fmul_rn(xn[i], cs), __fmul_rn(pn, sn)) : __fadd_rn(__fmul_rn(xn[i], cs), __fmul_rn(pn, sn));
+            out = attn_rotate(xn[i], xn[i < half ? i + half : i - half], cs, sn, i < half);
         }
         dst[i] = __float2bfloat16_rn(tf_glue::rbf(out));
     }

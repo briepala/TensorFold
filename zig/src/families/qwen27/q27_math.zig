@@ -1,4 +1,4 @@
-//! Host copy of q27_math.cuh: one Cody-Waite sine and cosine, the RMS inverse, the attention scale.
+//! Host copy of q27_math.cuh plus libdevice __nv_sinf/__nv_cosf (CUDA Math API / libdevice.10.bc, PTX cvt.rni.s32.f32).
 
 const std = @import("std");
 const gm = @import("nemotron").glue_math;
@@ -57,4 +57,56 @@ pub fn sincos(x: f32, sn: *f32, cs: *f32) void {
             cs.* = s;
         },
     }
+}
+
+fn fbits(u: u32) f32 {
+    return @bitCast(u);
+}
+
+/// cvt.rni.s32.f32: round to nearest, ties to even. Zig @round is ties away from zero.
+fn cvtRniS32(x: f32) i32 {
+    @setFloatMode(.strict);
+    const mag: f32 = 0x1.0p23;
+    if (x >= mag or x <= -mag) return @intFromFloat(x);
+    const magic: f32 = if (x < 0) -mag else mag;
+    return @intFromFloat((x + magic) - magic);
+}
+
+fn nvPoly(a: f32, for_cos: bool) f32 {
+    @setFloatMode(.strict);
+    if (@abs(a) >= 1.056150e5) {
+        var sn: f32 = 0;
+        var cs: f32 = 0;
+        sincos(a, &sn, &cs);
+        return if (for_cos) cs else sn;
+    }
+    const j = cvtRniS32(a * fbits(0x3f22f983));
+    const jf: f32 = @floatFromInt(j);
+    var f = gm.fma(jf, fbits(0xbfc90fda), a);
+    f = gm.fma(jf, fbits(0xb3a22168), f);
+    f = gm.fma(jf, fbits(0xa7c234c5), f);
+    const q = if (for_cos) j + 1 else j;
+    const s = f * f;
+    const odd = q & 1 != 0;
+    const b: f32 = if (odd) 1.0 else f;
+    const sb = gm.fma(s, b, 0);
+    var p: f32 = if (odd) gm.fma(fbits(0x37cbac00), s, fbits(0xbab607ed)) else fbits(0xb94d4153);
+    p = gm.fma(p, s, if (odd) fbits(0x3d2aaabb) else fbits(0x3c0885e4));
+    p = gm.fma(p, s, if (odd) fbits(0xbeffffff) else fbits(0xbe2aaaa8));
+    var r = gm.fma(p, sb, b);
+    if (q & 2 != 0) r = gm.fma(r, -1.0, 0);
+    return r;
+}
+
+pub fn nvSinf(a: f32) f32 {
+    return nvPoly(a, false);
+}
+
+pub fn nvCosf(a: f32) f32 {
+    return nvPoly(a, true);
+}
+
+test "libdevice fast-path sin and cos at 0" {
+    try std.testing.expectEqual(@as(f32, 0), nvSinf(0));
+    try std.testing.expectEqual(@as(f32, 1), nvCosf(0));
 }

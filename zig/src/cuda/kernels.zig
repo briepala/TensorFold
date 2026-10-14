@@ -35,6 +35,7 @@ pub const b16: []const u8 = if (available) &Blob("fatbin_b16").bytes else &.{};
 pub const q27_rows: []const u8 = if (available) &Blob("fatbin_q27_rows").bytes else &.{};
 pub const q27_prep: []const u8 = if (available) &Blob("fatbin_q27_prep").bytes else &.{};
 pub const q27_tree: []const u8 = if (available) &Blob("fatbin_q27_tree").bytes else &.{};
+pub const q27_draft: []const u8 = if (available) &Blob("fatbin_q27_draft").bytes else &.{};
 pub const sample: []const u8 = if (available) &Blob("fatbin_sample").bytes else &.{};
 pub const train: []const u8 = if (available) &Blob("fatbin_train").bytes else &.{};
 pub const qmmf: []const u8 = if (available) &Blob("fatbin_qmmf").bytes else &.{};

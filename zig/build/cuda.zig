@@ -32,9 +32,10 @@ const kernels = [_]Kernel{
     .{ .name = "lane_gemv", .flags = &.{"-O3"} }, // ours: qmm_group's arithmetic, a column tile's K slices in one CTA
     .{ .name = "exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // cuda/exl3/linear.py, tensorfold_exl3_linear_v3
     .{ .name = "b16", .flags = &.{"-O3"} }, // families/qwen3_5/cuda/b16.py, unquantized fp16/bf16 projections
-    .{ .name = "q27_rows", .flags = &.{ "-O3", "--fmad=false" } }, // ours: the 27B's row glue (add+RMSNorm, SwiGLU, embed)
-    .{ .name = "q27_prep", .flags = &.{ "-O3", "--fmad=false" } }, // ours: gdn_pre, attn_prep rotary, attn_row
-    .{ .name = "q27_tree", .flags = &.{ "-O3", "--fmad=false" } }, // ours: kernel_attention.py's tree attention, hand-ported
+    .{ .name = "q27_rows", .flags = glue }, // ours: the 27B's row glue (add+RMSNorm, SwiGLU, group sums, embed)
+    .{ .name = "q27_prep", .flags = glue }, // ours: gdn prep and attention prep, IEEE division and square root
+    .{ .name = "q27_tree", .flags = glue }, // ours: tree attention, the 64-key warp tile through head dim 256
+    .{ .name = "q27_draft", .flags = glue }, // ours: the drafter's conv, rotary prep and block attention
     .{ .name = "sample", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the Metal engine's keyed draws
     .{ .name = "train", .flags = &.{"-O3"} }, // ours: Sliding Weights' learning step (train.metal's kernels)
     .{ .name = "qwen_ops", .flags = &.{"-O3"} }, // ours: the 27B's batched state copies, taps, drafter norms and rotary

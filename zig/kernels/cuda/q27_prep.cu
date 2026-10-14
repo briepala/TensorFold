@@ -1,157 +1,126 @@
-//! Mixer glue: the GDN in-projection's conv/norm/gates, attention q/k norm with rotary, and one-row attention.
+// GDN prep and attention prep. dk 128 q/k is a 64-thread pair reduction. Positions are int32. A and B are fp16 or bf16.
 
 #include <cuda_bf16.h>
-#include <cuda_runtime.h>
-
-#include <cstdint>
+#include <cuda_fp16.h>
 
 #include "glue_math.cuh"
-
-namespace tf_q27 {
+#include "q27_math.cuh"
 
 using bf16 = __nv_bfloat16;
 
-// One row's conv, SiLU and q/k/v prep (glue.py's _gdn_pre). 64 threads: 2 lanes a dk element pair at dk = 128.
-__global__ void __launch_bounds__(64) gdn_pre(const bf16* __restrict__ qkv, const bf16* __restrict__ conv_state,
-                                              const bf16* __restrict__ conv_w, const int* __restrict__ window,
-                                              const bf16* __restrict__ a, const bf16* __restrict__ b,
-                                              const float* __restrict__ a_log, const bf16* __restrict__ dt_bias,
-                                              bf16* __restrict__ q, bf16* __restrict__ k, bf16* __restrict__ v,
-                                              float* __restrict__ g, float* __restrict__ beta, int c, int kh, int vh,
-                                              int dk, int nkeep) {
-    const int row = blockIdx.x;
-    const int head = blockIdx.y;               // 0..kh-1 q, kh..2kh-1 k, then vh v heads
-    const int pair = threadIdx.x >> 1;         // 32 element pairs
-    const int half = threadIdx.x & 1;
-    const int ch = head * dk + pair * 2 + half;
-    const int conv_dim = 2 * kh * dk + vh * dk;
-    if (ch >= conv_dim) return;
-    float acc = 0.f;
-    const bool multi = window != nullptr;
-#pragma unroll 4
-    for (int j = 0; j < nkeep + 1; ++j) {
-        const int src = multi ? window[row * (nkeep + 1) + j] : j - nkeep;
-        const bool from_state = src < nkeep;
-        const float x = from_state ? tf_glue::bf(conv_state[src * conv_dim + ch])
-                                   : tf_glue::bf(qkv[(src - nkeep) * conv_dim + ch]);
-        acc = __fmaf_rn(x, tf_glue::bf(conv_w[ch * (nkeep + 1) + j]), acc);
+__device__ float ab_f32(const void* p, int i, int f16) {
+    if (f16) return __half2float(reinterpret_cast<const __half*>(p)[i]);
+    return tf_glue::bf(reinterpret_cast<const bf16*>(p)[i]);
+}
+
+// One channel of the depthwise conv, then SiLU rounded through bf16.
+__device__ float gdn_conv(const bf16* qkv, const bf16* cs, const bf16* cw, const int* win, int row, int ch, int c, int cs_row, int nkeep) {
+    float sum = 0.f;
+    if (ch < c) {
+        for (int j = 0; j < nkeep + 1; ++j) {
+            const int src = win[row * (nkeep + 1) + j];
+            const float x = src < nkeep ? tf_glue::bf(cs[((size_t)cs_row + src) * c + ch])
+                                        : tf_glue::bf(qkv[(size_t)(src - nkeep) * c + ch]);
+            const float w = tf_glue::bf(cw[(size_t)ch * (nkeep + 1) + j]);
+            sum = __fmaf_rn(x, w, sum);
+        }
     }
-    const float silu = tf_glue::rbf(acc / (1.f + tf_glue::tf_exp(-acc)));
-    if (head < 2 * kh) {
-        const bool is_q = head < kh;
-        __shared__ float sq[64];
-        sq[threadIdx.x] = (pair * 2 + half < dk) ? silu * silu : 0.f;
+    return tf_glue::rbf(__fmul_rn(sum, tf_q27m::mufu_sigmoid(sum)));
+}
+
+// Conv then SiLU, RMS-scaled q and k. dk 128: tid owns 2*tid and 2*tid+1, a warp butterfly, then the two warp sums.
+extern "C" __global__ void tf_q27_gdn_pre(const bf16* __restrict__ qkv, const bf16* __restrict__ cs, const bf16* __restrict__ cw,
+                                          const int* __restrict__ win, const void* __restrict__ a, const void* __restrict__ b,
+                                          const float* __restrict__ alog, const float* __restrict__ dtb, bf16* __restrict__ q,
+                                          bf16* __restrict__ k, bf16* __restrict__ v, float* __restrict__ g,
+                                          float* __restrict__ beta, const int* __restrict__ sid, int c, int kh, int vh, int dk,
+                                          int nkeep, int multi, int ab_f16) {
+    __shared__ float ws[2];
+    const int row = blockIdx.x, head = blockIdx.y;
+    const int cs_row = multi ? sid[row] * nkeep : 0;
+    if (dk == 128 && head < 2 * kh) {
+        const int tid = threadIdx.x;
+        const int i0 = tid * 2;
+        const int chb = head * dk;
+        const float c0 = gdn_conv(qkv, cs, cw, win, row, chb + i0, c, cs_row, nkeep);
+        const float c1 = gdn_conv(qkv, cs, cw, win, row, chb + i0 + 1, c, cs_row, nkeep);
+        float part = __fmaf_rn(c1, c1, __fmul_rn(c0, c0));
+        part = tf_q27m::bfly32(part);
+        if ((tid & 31) == 0) ws[tid >> 5] = part;
         __syncthreads();
+        const float inv = tf_q27m::mufu_inv_rms(__fadd_rn(ws[0], ws[1]), dk, 1e-6f);
+        const bool is_q = head < kh;
+        const float scale = is_q ? __fdiv_rn(1.f, static_cast<float>(dk)) : __fdiv_rn(1.f, __fsqrt_rn(static_cast<float>(dk)));
+        const int hk = is_q ? head : head - kh;
+        bf16* dst = (is_q ? q : k) + ((size_t)row * kh + hk) * dk;
+        dst[i0] = __float2bfloat16_rn(tf_glue::rbf(__fmul_rn(__fmul_rn(c0, inv), scale)));
+        dst[i0 + 1] = __float2bfloat16_rn(tf_glue::rbf(__fmul_rn(__fmul_rn(c1, inv), scale)));
+        return;
+    }
+    if (threadIdx.x != 0 || dk > 128) return;
+    float cv[128];
+    const int ch0 = head * dk;
+    if (head < 2 * kh) {
         float ss = 0.f;
-        for (int i = 0; i < 64; ++i) ss += sq[i];
-        const float inv = rsqrtf(__fdividef(ss, (float)dk) + 1e-6f);
-        const float scale = is_q ? __fdividef(1.f, (float)dk) : rsqrtf((float)dk);
-        const float out = tf_glue::rbf(silu * inv * scale);
-        const size_t at = ((size_t)row * kh + (is_q ? head : head - kh)) * dk + pair * 2 + half;
-        if (is_q) q[at] = __float2bfloat16(out); else k[at] = __float2bfloat16(out);
+        for (int i = 0; i < dk; ++i) {
+            cv[i] = gdn_conv(qkv, cs, cw, win, row, ch0 + i, c, cs_row, nkeep);
+            ss = __fmaf_rn(cv[i], cv[i], ss);
+        }
+        const float inv = tf_q27m::mufu_inv_rms(ss, dk, 1e-6f);
+        const bool is_q = head < kh;
+        const float scale = is_q ? __fdiv_rn(1.f, static_cast<float>(dk)) : __fdiv_rn(1.f, __fsqrt_rn(static_cast<float>(dk)));
+        const int hk = is_q ? head : head - kh;
+        bf16* dst = (is_q ? q : k) + ((size_t)row * kh + hk) * dk;
+        for (int i = 0; i < dk; ++i) dst[i] = __float2bfloat16_rn(tf_glue::rbf(__fmul_rn(__fmul_rn(cv[i], inv), scale)));
     } else {
         const int hv = head - 2 * kh;
-        v[((size_t)row * vh + hv) * dk + pair * 2 + half] = __float2bfloat16(silu);
-        if (threadIdx.x == 0) {
-            const float av = tf_glue::bf(a[(size_t)row * vh + hv]) + tf_glue::bf(dt_bias[hv]);
-            const float sp = av > 20.f ? av : __logf(1.f + tf_glue::tf_exp(av));
-            g[(size_t)row * vh + hv] = __expf(-__expf(a_log[hv]) * sp);
-            beta[(size_t)row * vh + hv] = 1.f / (1.f + tf_glue::tf_exp(-tf_glue::bf(b[(size_t)row * vh + hv])));
-        }
+        bf16* dst = v + ((size_t)row * vh + hv) * dk;
+        for (int i = 0; i < dk; ++i) dst[i] = __float2bfloat16_rn(gdn_conv(qkv, cs, cw, win, row, ch0 + i, c, cs_row, nkeep));
+        const float av = __fadd_rn(ab_f32(a, row * vh + hv, ab_f16), dtb[hv]);
+        const float sp = tf_q27m::mufu_softplus(av);
+        const float e = tf_q27m::mufu_exp(alog[hv]);
+        g[(size_t)row * vh + hv] = tf_q27m::mufu_exp(__fmul_rn(-e, sp));
+        beta[(size_t)row * vh + hv] = tf_q27m::mufu_sigmoid(ab_f32(b, row * vh + hv, ab_f16));
     }
 }
 
-// q/k RMSNorm then rotary (rotate-half pairs; mrope picks the axis's position when three coordinates are given).
-__global__ void __launch_bounds__(32) attn_prep(const bf16* __restrict__ qg, const bf16* __restrict__ kv,
-                                                const bf16* __restrict__ qn, const bf16* __restrict__ kn,
-                                                const float* __restrict__ pos, const float* __restrict__ inv,
-                                                bf16* __restrict__ qo, bf16* __restrict__ ko, float eps,
-                                                int h, int hkv, int d, int half, int rows, int hsec, int wsec) {
-    const int row = blockIdx.x, head = blockIdx.y, lane = threadIdx.x;
+// RMS then rotate-half. pos is int32. mrope_rows > 0 reads three coordinates at axis * mrope_rows + row.
+extern "C" __global__ void tf_q27_attn_prep(const bf16* __restrict__ qg, const bf16* __restrict__ kv, const bf16* __restrict__ qn,
+                                            const bf16* __restrict__ kn, const int* __restrict__ pos, const float* __restrict__ invf,
+                                            bf16* __restrict__ qo, bf16* __restrict__ ko, float eps, int h, int hkv, int d, int half,
+                                            int mrope_rows, int hsec, int wsec) {
+    if (threadIdx.x != 0 || d > 256) return;
+    const int row = blockIdx.x, head = blockIdx.y;
     const bool is_q = head < h;
     const int hd = is_q ? head : head - h;
-    const size_t base = is_q ? ((size_t)row * h + hd) * 2 * d : (size_t)row * hkv * d + (size_t)hd * d;
-    const bf16* __restrict__ src = is_q ? qg + base : kv + base;
-    const bf16* __restrict__ norm = is_q ? qn : kn;
-    bf16* __restrict__ dst = is_q ? qo + ((size_t)row * h + hd) * d : ko + ((size_t)row * hkv + hd) * d;
-    float acc = 0.f;
-    for (int i = lane; i < d; i += 32) acc = __fmaf_rn(tf_glue::bf(src[i]), tf_glue::bf(src[i]), acc);
-#pragma unroll
-    for (int m = 16; m; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
-    const float inv_norm = rsqrtf(__fdividef(acc, (float)d) + eps);
-    __shared__ bf16 normed[256];
-    for (int i = lane; i < d; i += 32) normed[i] = __float2bfloat16(tf_glue::rbf(tf_glue::bf(src[i]) * inv_norm * tf_glue::bf(norm[i])));
-    __syncthreads();
-    for (int i = lane; i < d; i += 32) {
-        const int partner = i < half ? i + half : (i < 2 * half ? i - half : i);
-        float out = tf_glue::bf(normed[i]);
+    const bf16* src = is_q ? qg + ((size_t)row * h + hd) * 2 * d : kv + ((size_t)row * hkv + hd) * d;
+    const bf16* norm = is_q ? qn : kn;
+    bf16* dst = is_q ? qo + ((size_t)row * h + hd) * d : ko + ((size_t)row * hkv + hd) * d;
+    float ss = 0.f;
+    for (int i = 0; i < d; ++i) {
+        const float xv = tf_glue::bf(src[i]);
+        ss = __fmaf_rn(xv, xv, ss);
+    }
+    const float inv = tf_q27m::mufu_inv_rms(ss, d, eps);
+    float xn[256];
+    for (int i = 0; i < d; ++i) xn[i] = tf_glue::rbf(__fmul_rn(__fmul_rn(tf_glue::bf(src[i]), inv), tf_glue::bf(norm[i])));
+    for (int i = 0; i < d; ++i) {
+        float out = xn[i];
         if (i < 2 * half) {
-            const int freq_i = i % half;
-            float p;
-            if (rows > 0) {                     // mrope: three coordinates, the axis by interleaved section
-                const int sec = freq_i % 3;
-                int axis = 0;
-                if (sec == 1 && freq_i < 3 * hsec) axis = 1;
-                if (sec == 2 && freq_i < 3 * wsec) axis = 2;
-                p = pos[axis * rows + row];
-            } else {
-                p = pos[row];
+            const int freq = i < half ? i : i - half;
+            int axis = 0;
+            if (mrope_rows > 0) {
+                const int sec = freq % 3;
+                if (sec == 1 && freq < 3 * hsec) axis = 1;
+                if (sec == 2 && freq < 3 * wsec) axis = 2;
             }
-            const float ang = p * inv[freq_i];
-            const float cs = __cosf(ang), sn = __sinf(ang);
-            const float pn = tf_glue::bf(normed[partner]);
-            out = i < half ? out * cs - pn * sn : out * cs + pn * sn;
+            const int pr = mrope_rows > 0 ? pos[axis * mrope_rows + row] : pos[row];
+            const float ang = __fmul_rn(static_cast<float>(pr), invf[freq]);
+            float sn, cs;
+            tf_q27m::sincos(ang, sn, cs);
+            const float pn = xn[i < half ? i + half : i - half];
+            out = i < half ? __fsub_rn(__fmul_rn(xn[i], cs), __fmul_rn(pn, sn)) : __fadd_rn(__fmul_rn(xn[i], cs), __fmul_rn(pn, sn));
         }
-        dst[i] = __float2bfloat16(tf_glue::rbf(out));
+        dst[i] = __float2bfloat16_rn(tf_glue::rbf(out));
     }
 }
-
-// One query row's attention over n keys: softmax(Q K^T scale) V in fp32, key order fixed. A warp, a lane d/32 elements.
-__global__ void __launch_bounds__(32) attn_row(const bf16* __restrict__ q, const bf16* __restrict__ keys,
-                                               const bf16* __restrict__ values, bf16* __restrict__ out,
-                                               int heads, int hkv, int d, long long n, float scale) {
-    const long long row = blockIdx.x;
-    const int head = blockIdx.y, lane = threadIdx.x;
-    const int kv_head = head / (heads / hkv);
-    const bf16* qr = q + ((size_t)row * heads + head) * d;
-    float o[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-    float m = -INFINITY, l = 0.f;
-    for (long long k0 = 0; k0 < n; k0 += 32) {
-        const long long k = k0 + lane;
-        float score = -INFINITY;
-        float kv_dot = 0.f;
-        if (k < n) {
-            const bf16* kr = keys + (size_t)k * hkv * d + (size_t)kv_head * d;
-            for (int i = 0; i < d; ++i) kv_dot = __fmaf_rn(tf_glue::bf(qr[i]), tf_glue::bf(kr[i]), kv_dot);
-            score = kv_dot * scale;
-        }
-        float new_m = m;
-        if (score > new_m) new_m = score;
-#pragma unroll
-        for (int mm = 16; mm; mm >>= 1) new_m = fmaxf(new_m, __shfl_xor_sync(0xffffffffu, new_m, mm));
-        const float alpha = (m == -INFINITY) ? 0.f : tf_glue::tf_exp(m - new_m);
-        const float p = score == -INFINITY ? 0.f : tf_glue::tf_exp(score - new_m);
-        l = l * alpha;
-#pragma unroll
-        for (int e = 0; e < 8; ++e) o[e] *= alpha;
-        if (k < n) {
-            l += p;
-            const bf16* vr = values + (size_t)k * hkv * d + (size_t)kv_head * d;
-#pragma unroll
-            for (int e = 0; e < 8; ++e) {
-                const int i = lane + e * 32;
-                if (i < d) o[e] = __fmaf_rn(p, tf_glue::bf(vr[i]), o[e]);
-            }
-        }
-        m = new_m;
-    }
-    const float inv_l = 1.f / l;
-    bf16* dst = out + ((size_t)row * heads + head) * d;
-#pragma unroll
-    for (int e = 0; e < 8; ++e) {
-        const int i = lane + e * 32;
-        if (i < d) dst[i] = __float2bfloat16(tf_glue::rbf(o[e] * inv_l));
-    }
-}
-
-}  // namespace tf_q27

@@ -34,7 +34,7 @@ pub fn plan(k: usize, n: usize, blocks: usize, min_tiles: usize) Plan {
             sk /= 2;
         } else {
             break;
-    }
+        }
     }
     return .{ .sk = sk, .wk = wk };
 }
@@ -193,8 +193,6 @@ pub const Linear = struct {
         if (l.own_mod) |*m| m.unload();
     }
 
-
-
     /// xh [M, K] fp16 = (x * suh) rotated by H / sqrt(128): rot_in_kernel, one block a 4-block span and row.
     pub fn rotIn(l: *const Linear, s: stream_.Stream, x: memory.DeviceBuffer, suh: memory.DeviceBuffer, xh: memory.DeviceBuffer, m: usize, k: usize) !void {
         const blocks = (k / 128 + 3) / 4;
@@ -299,13 +297,13 @@ pub const Linear = struct {
         args.add(@as(c_int, @intCast(w.n)));
         args.add(@as(i64, @intCast(w.strideK())));
         args.add(@as(i64, @intCast(w.strideN())));
-        if (std.c.getenv("TF_TRACE_LAUNCH") != null) std.debug.print("[unpack] grid=({d},{d}) k={d} n={d} halves={d} cb={d}\n", .{ w.n / 16, w.k / 16, w.k, w.n, w.width.halves, @intFromEnum(w.codebook) });
+        if (std.c.getenv("TF_TRACE_LAUNCH") != null) std.debug.print("[unpack] grid=({d},{d}) k={d} n={d} halves={d} cb={d}\n", .{ w.n / 16, w.k / 16, w.k, w.n, w.width.halves, @backingInt(w.codebook) });
         try launch.launch(f, .{ .grid = .{ .x = @intCast(w.n / 16), .y = @intCast(w.k / 16), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &args);
     }
 
     fn unpackFn(l: *const Linear, halves: u16, cb: Codebook) !@import("module.zig").Function {
         for (unp_syms, 0..) |sym, i| {
-            if (sym.k2 == halves and sym.cb == @intFromEnum(cb)) return l.unp[i];
+            if (sym.k2 == halves and sym.cb == @backingInt(cb)) return l.unp[i];
         }
         return error.UnsupportedWidth;
     }
@@ -313,7 +311,7 @@ pub const Linear = struct {
     fn function(l: *const Linear, wk: u32, cb: Codebook, halves: u16) !@import("module.zig").Function {
         const k2: u16 = halves;
         for (lin_syms, 0..) |sym, i| {
-            if (sym.k2 == k2 and sym.cb == @intFromEnum(cb) and sym.wk == wk) return l.lin[i];
+            if (sym.k2 == k2 and sym.cb == @backingInt(cb) and sym.wk == wk) return l.lin[i];
         }
         return error.UnsupportedWidth;
     }
@@ -373,7 +371,7 @@ fn uploadScale(d: *const Driver, a: std.mem.Allocator, t: format.Entry, size: us
         return out;
     }
     if (t.dtype == .i16 and t.bytes.len * 8 == size * 2) {
-        const words: []align(1) const i16 = @as([*]align(1) const i16, @ptrCast(t.bytes.ptr))[0..t.bytes.len / 2];
+        const words: []align(1) const i16 = @as([*]align(1) const i16, @ptrCast(t.bytes.ptr))[0 .. t.bytes.len / 2];
         const f16s = try a.alloc(f16, size);
         defer a.free(f16s);
         format.unpackSigns(words, f16s);

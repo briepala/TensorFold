@@ -67,8 +67,8 @@ fn drafterDir(a: std.mem.Allocator, io: std.Io, given: ?[]const u8) !?[]const u8
 const most_streams = 32;
 
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
-    // the 27B's glue runs the Python engine's Triton kernels, captured on this chip (no own glue kernels yet)
-    const e = try engine.Engine.init(gpa, io, ctx, dir, kernels orelse return error.QwenNeedsCapturedKernels, .{ .context = o.context });
+    // `kernels` empty: the captured set stays unloaded. The three launch files call q27_* only.
+    const e = try engine.Engine.init(gpa, io, ctx, dir, kernels, .{ .context = o.context });
     errdefer e.deinit();
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);

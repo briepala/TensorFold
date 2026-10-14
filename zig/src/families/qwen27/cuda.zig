@@ -3,6 +3,12 @@
 pub const config = @import("cuda/shape.zig");
 pub const kernels = @import("cuda/kernels.zig");
 pub const triton = @import("cuda/triton.zig");
+pub const glue = @import("cuda/glue.zig");
+pub const q27_math = @import("q27_math.zig");
+pub const glue_ref = @import("glue_ref.zig");
+pub const mufu_ref = @import("mufu_ref.zig");
+pub const glue_tree_ref = @import("glue_tree_ref.zig");
+pub const glue_draft_ref = @import("glue_draft_ref.zig");
 pub const weights = @import("cuda/weights.zig");
 pub const state = @import("cuda/state.zig");
 pub const Forward = @import("cuda/forward.zig").Forward;
@@ -19,6 +25,12 @@ test {
     _ = config;
     _ = kernels;
     _ = triton;
+    _ = glue;
+    _ = q27_math;
+    _ = glue_ref;
+    _ = mufu_ref;
+    _ = glue_tree_ref;
+    _ = glue_draft_ref;
     _ = weights;
     _ = state;
     _ = engine;

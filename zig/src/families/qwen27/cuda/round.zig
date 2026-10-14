@@ -4,6 +4,7 @@ const std = @import("std");
 const c = @import("shape.zig");
 const kern = @import("kernels.zig");
 const tri = @import("triton.zig");
+const glue = @import("glue.zig");
 const st = @import("state.zig");
 const tree = @import("tree.zig");
 
@@ -115,8 +116,8 @@ fn plans(gpa: std.mem.Allocator, parts: []const Part, starts: []const usize, mul
     }
 }
 
-/// Uploads the round's inputs and runs attention's _paths; the caller's layer loop reads the returned Round.
-pub fn stage(gpa: std.mem.Allocator, ops: kern.Ops, t: tri.Tri, s: *st.Scratch, g: c.Geometry, parts: []const Part) !Round {
+/// Uploads the round's inputs and runs q27 paths; the caller's layer loop reads the returned Round.
+pub fn stage(gpa: std.mem.Allocator, ops: kern.Ops, t: glue.Glue, s: *st.Scratch, g: c.Geometry, parts: []const Part) !Round {
     if (parts.len == 0 or parts.len > st.max_streams) return error.InvalidQwenWindows;
     var W: usize = 0;
     var r: Round = undefined;

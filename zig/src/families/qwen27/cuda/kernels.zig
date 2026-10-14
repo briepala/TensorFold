@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const cuda = @import("cuda");
+const glue = @import("glue.zig");
 pub const torch_ops = @import("nemotron").torch_ops;
 pub const Trellis = @import("exl3_scratch.zig").Trellis;
 
@@ -52,11 +53,19 @@ pub const QLinear = union(enum) {
     b16: B16W,
 
     pub fn n(q: QLinear) usize {
-        return switch (q) { .affine4 => |a| a.n, .exl3 => |e| e.w.n, .b16 => |b| b.n };
+        return switch (q) {
+            .affine4 => |a| a.n,
+            .exl3 => |e| e.w.n,
+            .b16 => |b| b.n,
+        };
     }
 
     pub fn k(q: QLinear) usize {
-        return switch (q) { .affine4 => |a| a.k, .exl3 => |e| e.w.k, .b16 => |b| b.k };
+        return switch (q) {
+            .affine4 => |a| a.k,
+            .exl3 => |e| e.w.k,
+            .b16 => |b| b.k,
+        };
     }
 };
 
@@ -71,7 +80,7 @@ pub const B16W = struct { w: u64, n: usize, k: usize, fp16: bool = false };
 
 pub const Kernels = struct {
     d: *const cuda.Driver,
-    mods: [18]cuda.Module,
+    mods: [17]cuda.Module,
     mods_loaded: usize = 15, // the 15 base images; slots 15/16 are exl3 and b16 when they loaded
     exl3: cuda.exl3.Linear = undefined,
     b16_rows: [3]cuda.Function = undefined, // R = 1, 4, 16 (bf16)
@@ -81,8 +90,9 @@ pub const Kernels = struct {
     b16_on: bool = false,
     b16_embed: cuda.Function = undefined, // q27_rows.cu's b16_embed: bf16 table rows gathered by id
     to_f16: cuda.Function = undefined, // q27_rows.cu's bf16_to_f16: an fp16 weight's inputs, as b16.matmul casts them
-    q27_rows_mod: ?cuda.Module = null, // loaded best-effort beside b16
-    triton: cuda.aot.Set,
+    q27: [4]cuda.Module = undefined, // rows, prep, tree, draft: required, resolved by extern "C" name
+    glue: glue.Fns = undefined,
+    triton: ?cuda.aot.Set = null, // a captured set, unused by the three launch files
     group: cuda.Function,
     wide: [wide.len]cuda.Function, // tiles 3-5: rows <= 32, <= 64, more
     gemv: cuda.Function,
@@ -109,8 +119,8 @@ pub const Kernels = struct {
     gb10: bool,
     discrete: bool, // the card has its own memory: checkpoint bytes reach it through page-locked slots
 
-    /// Loads every module; `triton_dir` holds the captured aot.json and cubins for this GPU.
-    pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, triton_dir: []const u8, heads: usize) !Kernels {
+    /// Loads every module. `triton_dir`, when non-empty, is a captured set the launch files do not call.
+    pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, triton_dir: ?[]const u8, heads: usize) !Kernels {
         const d = ctx.d;
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         var k: Kernels = undefined;
@@ -159,15 +169,6 @@ pub const Kernels = struct {
         } else |e| {
             std.log.err("b16 module failed to load: {}", .{e});
         }
-        if (cuda.Module.load(d, kk.q27_rows)) |m| {
-            k.mods[17] = m;
-            loaded_extra += 1;
-            k.mods_loaded = 15 + loaded_extra;
-            k.b16_embed = try k.mods[17].function(cuda.kernels.q27_symbols.b16_embed);
-            k.to_f16 = try k.mods[17].function(cuda.kernels.q27_symbols.bf16_to_f16);
-        } else |e| {
-            std.log.err("q27_rows module failed to load: {} — b16_embed stays unset", .{e});
-        }
         var loaded: usize = 0;
         errdefer for (k.mods[0..loaded]) |*m| m.unload();
         for (images, 0..) |img, i| {
@@ -199,8 +200,23 @@ pub const Kernels = struct {
         // gdn_prefill_cuda: a block takes 128 value rows, or 64 when there are fewer heads than SMs
         k.prompt_rows = if (heads >= sms) 128 else 64;
         k.prompt_chain = try k.mods[5].function(if (k.prompt_rows == 128) sym.chain128 else sym.chain64);
-        k.triton = try cuda.aot.Set.load(gpa, io, d, ctx.device, triton_dir);
-        errdefer k.triton.deinit();
+        const qimgs = [_][]const u8{ kk.q27_rows, kk.q27_prep, kk.q27_tree, kk.q27_draft };
+        var nq: usize = 0;
+        errdefer for (k.q27[0..nq]) |*qm| qm.unload();
+        for (qimgs, 0..) |img, qi| {
+            k.q27[qi] = try cuda.Module.load(d, img);
+            nq += 1;
+        }
+        k.glue = try glue.Fns.resolve(&k.q27);
+        try k.glue.shared.allowDynamicShared(glue.treeSmem(256));
+        try k.glue.tail.allowDynamicShared(glue.treeSmem(256));
+        k.b16_embed = k.glue.b16_embed;
+        k.to_f16 = k.glue.bf16_to_f16;
+        var captured: ?cuda.aot.Set = null;
+        errdefer if (captured) |*t| t.deinit();
+        const dir = triton_dir orelse "";
+        if (dir.len != 0) captured = try cuda.aot.Set.load(gpa, io, d, ctx.device, dir);
+        k.triton = captured;
         try k.group.allowDynamicShared(group_smem);
         for (k.wide, wide) |f, t| try f.allowDynamicShared(t.smem);
         try k.gemv.allowDynamicShared(group_smem);
@@ -218,7 +234,8 @@ pub const Kernels = struct {
     }
 
     pub fn deinit(k: *Kernels) void {
-        k.triton.deinit();
+        if (k.triton) |*t| t.deinit();
+        for (&k.q27) |*qm| qm.unload();
         for (k.mods[0..k.mods_loaded]) |*m| m.unload();
         k.pack_mod.unload();
     }
@@ -301,8 +318,16 @@ pub const Ops = struct {
     /// b16 rows: a warp a column over R rows (R by row count: 1, 4, 16), fp16 or bf16 weights.
     fn b16Rows(o: Ops, x: u64, b: B16W, out: u64, rows: usize) !void {
         const i: usize = if (rows <= 1) 0 else if (rows <= 4) 1 else 2;
-        const r: usize = switch (i) { 0 => 1, 1 => 4, else => 16 };
-        const warps: usize = switch (i) { 0 => 4, 1 => 8, else => 16 };
+        const r: usize = switch (i) {
+            0 => 1,
+            1 => 4,
+            else => 16,
+        };
+        const warps: usize = switch (i) {
+            0 => 4,
+            1 => 8,
+            else => 16,
+        };
         const xin = if (b.fp16) try o.toF16(x, rows * b.k) else x;
         var a: cuda.Args = .{};
         a.add(xin);
@@ -406,30 +431,9 @@ pub const Ops = struct {
                 for ([_]usize{ rows, w4.n, w4.k, w4.npad, w4.k, group }) |v| a.add(int(v));
                 try o.go(o.k.prefill_mm, .{ rows_t * ((w4.n + 127) / 128), 1, 1 }, 128, prefill_mm_smem, &a);
             },
-            .exl3 => |e| return o.exl3Prefill(e, x, out, rows),
+            .exl3 => |e| return o.exl3Dense(e, x, out, rows),
             .b16 => |b| return o.b16Prompt(x, b, out, rows),
         }
-    }
-
-    /// The EXL3 prompt path: rot_in, W_q unpacked once, the captured _gemm with the Hadamard epilogue.
-    fn exl3Prefill(o: Ops, e: Exl3W, x: u64, out: u64, rows: usize) !void {
-        if (std.c.getenv("TF_SKIP_EXL3") != null) return; // bisect
-        const t = o.trellis orelse return error.TrellisScratchMissing;
-        const xh = try t.xhAt(rows, e.w.k);
-        try e.lin.rotInPtr(o.s, x, e.w.suh.ptr, xh, rows, e.w.k);
-        const wq = try t.wqAt(e.w.k, e.w.n);
-        try e.lin.unpackPtr(o.s, e.w, wq);
-        const h = try t.hadamardAt();
-        const bias = if (e.w.bias.ptr != 0) e.w.bias.ptr else e.w.svh.ptr;
-        try o.k.triton.run(o.s, "_gemm", .{ @intCast(((rows + 127) / 128) * (e.w.n / 128)), 1, 1 }, &.{
-            cuda.aot.ptr("X", "*fp16", xh),   cuda.aot.ptr("W", "*fp16", wq),   cuda.aot.ptr("H", "*bf16", h),
-            cuda.aot.ptr("SVH", "*fp16", e.w.svh.ptr), cuda.aot.ptr("BIAS", "*fp16", bias), cuda.aot.ptr("OUT", "*bf16", out),
-            cuda.aot.int("M", @intCast(rows)), cuda.aot.int("o_stride", @intCast(e.w.n)),
-        }, &.{
-            cuda.aot.ci("K", @intCast(e.w.k)), cuda.aot.ci("N", @intCast(e.w.n)), cuda.aot.ci("BM", 128), cuda.aot.ci("BK", 32),
-            cuda.aot.ci("GROUP", 8), cuda.aot.ci("HAS_BIAS", @intFromBool(e.w.bias.ptr != 0)),
-            cuda.aot.cf("SCALE", @bitCast(had_scale_bits)),
-        });
     }
 
     /// b16.prompt: bf16 weights on the BM-tile mma kernel; an fp16 weight (in_proj_a/b) or K off 64 takes b16.matmul.
@@ -463,9 +467,6 @@ pub const Ops = struct {
         try o.go(o.k.to_f16, .{ @min((n + 255) / 256, 4096), 1, 1 }, 256, 0, &a);
         return y;
     }
-
-    /// 1/sqrt(128) as fp32 bits, the _gemm epilogue's SCALE (prefill.py's HAD_SCALE).
-    pub const had_scale_bits: u32 = 0x3db504f3;
 
     /// gdn.tree (dispatch_tree): y from one `state`, or each stream's own by `table` and `starts`; `slots` 0: chains.
     pub fn gdnTree(o: Ops, q: u64, k: u64, v: u64, g: u64, beta: u64, state: u64, table: u64, starts: u64, plan: u64, y: u64, rows: usize, streams: usize, slots: usize, most: usize, h: Heads) !void {

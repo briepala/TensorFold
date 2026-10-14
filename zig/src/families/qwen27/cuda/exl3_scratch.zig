@@ -6,9 +6,9 @@ const cuda = @import("cuda");
 /// The trellis decode's scratch, grown to the largest call and reused (calls run in order on one stream).
 pub const Trellis = struct {
     d: *const cuda.Driver,
-    xh: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0 },   // fp16 rotated inputs
-    z: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0 },    // fp32 split-K partials
-    wq: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0 },   // fp16 unpacked W_q (prompt)
+    xh: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0 }, // fp16 rotated inputs
+    z: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0 }, // fp32 split-K partials
+    wq: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0 }, // fp16 unpacked W_q (prompt)
     hadamard: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0 }, // the 128x128 H, bf16
 
     pub fn init(d: *const cuda.Driver) Trellis {

@@ -5,17 +5,17 @@ const cuda = @import("cuda");
 const qwen = @import("qwen27");
 
 const usage =
-    \\usage: tf-qwen27-cuda run MODEL --kernels DIR --prompts prompts.json [--expect results.json]
+    \\usage: tf-qwen27-cuda run MODEL --prompts prompts.json [--kernels DIR] [--expect results.json]
     \\         [--max-tokens N] [--context N] [--device N]
-    \\  Greedy, drafts off: each prompt's tokens and their sha against the capture's.
-    \\       tf-qwen27-cuda windows MODEL --kernels DIR --prompts windows.json
-    \\  capture_windows.py's chains and shared rounds: each row's logits against the capture's sha256.
-    \\       tf-qwen27-cuda draft MODEL --kernels DIR --drafter DIR --prompts prompts.json [--expect draft.json]
-    \\  draft_decode with DFlash2, greedy: tokens (equal to serial) and rounds against capture_draft.py's.
-    \\       tf-qwen27-cuda rounds MODEL --kernels DIR --prompts windows.json [--max-tokens ROUNDS]
+    \\  Greedy, drafts off: each prompt's tokens and their sha against the capture's. Kernels are the 27B's own.
+    \\       tf-qwen27-cuda windows MODEL --prompts windows.json [--kernels DIR]
+    \\  Chains and shared rounds: each row's logits against the capture's sha256.
+    \\       tf-qwen27-cuda draft MODEL --drafter DIR --prompts prompts.json [--kernels DIR] [--expect draft.json]
+    \\  draft_decode with DFlash2, greedy: tokens and rounds against a recorded draft.
+    \\       tf-qwen27-cuda rounds MODEL --prompts windows.json [--kernels DIR] [--max-tokens ROUNDS]
     \\  Greedy shared rounds of one row a stream over every prompt, timed.
-    \\       tf-qwen27-cuda multi MODEL --kernels DIR --drafter DIR --prompts multi.json
-    \\  capture_multi.py's drafted shared rounds: each round's windows and every reply against the capture's.
+    \\       tf-qwen27-cuda multi MODEL --drafter DIR --prompts multi.json [--kernels DIR]
+    \\  Drafted shared rounds: each round's windows and every reply against a recorded multi run.
     \\
 ;
 
@@ -54,7 +54,7 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         }
     }
-    if (o.kernels.len == 0 or o.prompts.len == 0) {
+    if (o.prompts.len == 0) {
         std.debug.print("{s}", .{usage});
         return 2;
     }
@@ -66,7 +66,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer ctx.deinit();
     const clock = std.Io.Clock.awake;
     var t0 = clock.now(init.io).toNanoseconds();
-    const e = try qwen.Engine.init(gpa, init.io, &ctx, o.model, o.kernels, .{ .context = o.context });
+    const kernels: ?[]const u8 = if (o.kernels.len == 0) null else o.kernels;
+    const e = try qwen.Engine.init(gpa, init.io, &ctx, o.model, kernels, .{ .context = o.context });
     defer e.deinit();
     std.debug.print("loaded in {d:.1}s, weights {d:.2} GiB\n", .{ @as(f64, @floatFromInt(clock.now(init.io).toNanoseconds() - t0)) / 1e9, @as(f64, @floatFromInt(e.w.bytes())) / (1 << 30) });
     if (windows) return checkWindows(gpa, arena, init.io, e, prompts, o.dump, o.cases);

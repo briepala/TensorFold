@@ -1,10 +1,10 @@
 //! The 27B's forward on CUDA: verify rounds (tree_forward, multi_tree_forward), their commit, and prompt chunks.
 
 const std = @import("std");
-const cuda = @import("cuda");
 const c = @import("shape.zig");
 const kern = @import("kernels.zig");
 const tri = @import("triton.zig");
+const glue = @import("glue.zig");
 const st = @import("state.zig");
 const wts = @import("weights.zig");
 const rnd = @import("round.zig");
@@ -18,7 +18,7 @@ pub const Forward = struct {
     gpa: std.mem.Allocator,
     w: *const wts.Weights,
     ops: kern.Ops,
-    t: tri.Tri,
+    t: glue.Glue,
     s: *st.Scratch,
     dump: ?Dump = null, // a debugging copy of every norm's (h, y) rows, as capture.py's hook writes them
     taps: ?u64 = null, // rows of the drafter's five layer taps (5 x hidden bf16), written by round and chunk
@@ -32,7 +32,10 @@ pub const Forward = struct {
     /// in_proj_a/b's storage dtype: an EXL3 pack keeps them fp16, an MLX pack's tiled copy is bf16.
     fn abF16(f: *const Forward, q: kern.QLinear) bool {
         _ = f;
-        return switch (q) { .b16 => |b| b.fp16, else => false };
+        return switch (q) {
+            .b16 => |b| b.fp16,
+            else => false,
+        };
     }
 
     fn gdnShape(f: *const Forward) tri.Gdn {
@@ -57,15 +60,7 @@ pub const Forward = struct {
     fn embed(f: *Forward, e: wts.Embed, ids: u64, out: u64, rows: usize) !void {
         switch (e) {
             .mlx => |m| try f.t.embed(ids, m.w, m.s, m.b, out, rows, f.g().hidden),
-            .b16 => |b| {
-                var a: cuda.Args = .{};
-                a.add(ids);
-                a.add(b.w);
-                a.add(out);
-                a.add(@as(c_int, @intCast(b.d)));
-                if (std.c.getenv("TF_TRACE_LAUNCH") != null) std.debug.print("[embed-b16] rows={d} d={d}\n", .{ rows, b.d });
-                try cuda.launch.launch(f.ops.k.b16_embed, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 32 } }, f.ops.s, &a);
-            },
+            .b16 => |b| try f.t.b16Embed(ids, b.w, out, rows, b.d),
         }
     }
 

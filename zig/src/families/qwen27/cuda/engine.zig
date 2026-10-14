@@ -4,7 +4,6 @@ const std = @import("std");
 const cuda = @import("cuda");
 const c = @import("shape.zig");
 const kern = @import("kernels.zig");
-const tri = @import("triton.zig");
 const st = @import("state.zig");
 const wts = @import("weights.zig");
 const Forward = @import("forward.zig").Forward;
@@ -31,7 +30,7 @@ pub const Engine = struct {
     scratch: st.Scratch,
     context: usize,
 
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !*Engine {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !*Engine {
         const cfg = try c.Config.read(gpa, io, dir);
         const g = cfg.g;
         const e = try gpa.create(Engine);
@@ -69,7 +68,7 @@ pub const Engine = struct {
     }
 
     pub fn forward(e: *Engine) Forward {
-        return .{ .gpa = e.gpa, .w = &e.w, .ops = e.ops(), .t = .{ .set = &e.k.triton, .s = e.s }, .s = &e.scratch };
+        return .{ .gpa = e.gpa, .w = &e.w, .ops = e.ops(), .t = .{ .f = &e.k.glue, .s = e.s }, .s = &e.scratch };
     }
 
     /// A stream's state for `capacity` positions (its caches, recurrences and conv windows), empty.

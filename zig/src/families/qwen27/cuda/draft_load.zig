@@ -206,19 +206,18 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
         };
         const hs = try tk.get("language_model.lm_head.scales");
         const hb = try tk.get("language_model.lm_head.biases");
-    const a = spans[1][0];
-    const n = spans[1][1] - a;
-    const k8 = hidden / 8;
-    const kg = hidden / 64;
-    // mapped tensors may sit at odd offsets: the rows go through aligned host arrays
-    try L.words.resize(gpa, n * k8);
-    try L.scales.resize(gpa, n * kg);
-    try L.biases.resize(gpa, n * kg);
-    @memcpy(std.mem.sliceAsBytes(L.words.items), hw.bytes[a * k8 * 4 ..][0 .. n * k8 * 4]);
-    @memcpy(std.mem.sliceAsBytes(L.scales.items), hs.bytes[a * kg * 2 ..][0 .. n * kg * 2]);
-    @memcpy(std.mem.sliceAsBytes(L.biases.items), hb.bytes[a * kg * 2 ..][0 .. n * kg * 2]);
-    w.head_tail = try L.tile(L.words.items, L.scales.items, L.biases.items, n, hidden);
+        const a = spans[1][0];
+        const n = spans[1][1] - a;
+        const k8 = hidden / 8;
+        const kg = hidden / 64;
+        // mapped tensors may sit at odd offsets: the rows go through aligned host arrays
+        try L.words.resize(gpa, n * k8);
+        try L.scales.resize(gpa, n * kg);
+        try L.biases.resize(gpa, n * kg);
+        @memcpy(std.mem.sliceAsBytes(L.words.items), hw.bytes[a * k8 * 4 ..][0 .. n * k8 * 4]);
+        @memcpy(std.mem.sliceAsBytes(L.scales.items), hs.bytes[a * kg * 2 ..][0 .. n * kg * 2]);
+        @memcpy(std.mem.sliceAsBytes(L.biases.items), hb.bytes[a * kg * 2 ..][0 .. n * kg * 2]);
+        w.head_tail = try L.tile(L.words.items, L.scales.items, L.biases.items, n, hidden);
     }
     return w;
 }
-

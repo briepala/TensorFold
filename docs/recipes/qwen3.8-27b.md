@@ -246,11 +246,11 @@ Facts that still hold for the EXL3 27B CUDA path on sm_86:
 - Prompt rows use `exl3Dense` (the EXL3 prompt GEMM), not a Triton `_gemm` cubin.
 - Glue is four required fatbins beside the image array: `q27_rows`, `q27_prep`, `q27_tree`, and `q27_draft.cu`.
 - Tree and block attention still use sequential fp32 dots (`__fmaf_rn`) rather than Triton's `tl.dot` / `HMMA.16816.F32.BF16` ([HMMA notes](../q27-sm86-hmma.md)).
-- Attention prep at head dim 256 calls libdevice `__nv_sinf` / `__nv_cosf` (CUDA Math API); other widths keep Cody-Waite `tf_q27m::sincos`.
+- Attention prep at head dim 256 calls libdevice `__nv_sinf` / `__nv_cosf` (CUDA Math API); other widths keep Cody-Waite `tf_q27m::sincos`. The captured `_attn_prep` inlines that polynomial with `FFMA.FTZ` / `F2I.FTZ.NTZ`; the published fatbin stays `--ftz=false` (IEEE `FFMA` / `F2I.NTZ`) until a GPU sincos probe says otherwise.
 - Tree attention's warp tile extends to head dim 256 with keys and values in one file-scope dynamic shared buffer (`q27_tree_smem`, `treeSmem(256)=65792`).
 - Width-5120 add-RMSNorm is a 256-thread reduction plus MUFU `sqrt.approx` then `rcp.approx`.
 - Host `ex2.approx` keeps the captured tie and flush rules in `mufu_ref.zig` (do not change those tables).
 - Standalone group-sums is the 8-lane balanced tree launched by the drafter and the head.
-- Drafter prep (`dprep`) is a 32-lane pair butterfly with per-lane `rsqrt.approx` and a contracted rotate.
+- Drafter prep (`dprep`) is a 32-lane pair butterfly with per-lane `rsqrt.approx` and contracted rotate `fmaf(a, cos, -(b * sin))` (Triton `FFMA a, cos, -prod`). The `fmaf(-b, sin, a * cos)` try did not match that SASS.
 - GDN prep at `dk==128` is a 64-thread pair reduction.
 

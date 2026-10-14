@@ -46,7 +46,7 @@ fn dprepPair(src: []const u16, norm: []const u16, cos: []const f32, sin: []const
     const b = gm.rbf((bf(src[half + i]) * inv_b) * bf(norm[half + i]));
     const cs = cos[row * half + i];
     const sn = sin[row * half + i];
-    dst[i] = store(gm.fma(-b, sn, a * cs));
+    dst[i] = store(gm.fma(a, cs, -(b * sn)));
     dst[half + i] = store(gm.fma(b, cs, a * sn));
 }
 

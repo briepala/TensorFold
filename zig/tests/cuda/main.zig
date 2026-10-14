@@ -24,6 +24,8 @@ const modelopt_tests = @import("modelopt_tests.zig");
 const train_pack = @import("train_pack.zig");
 const exlr8_tests = @import("exlr8_tests.zig");
 const exlr8_dense_tests = @import("exlr8_dense_tests.zig");
+const q27_glue_tests = @import("q27_glue_tests.zig");
+const q27_cubin_tests = @import("q27_cubin_tests.zig");
 
 const usage =
     \\usage: tf-cuda-test <command>
@@ -59,6 +61,8 @@ const usage =
     \\  exlr8-bench DIR [MANIFEST] [LAYER] [SETS]   a real EXLR8 layer: FP64, row windows, then GB/s by stage
     \\  exlr8-dense [DIR]         EXLR8 dense formats: decode bit-equal, FP64, row windows; DIR adds the real matrices
     \\  train-pack MODEL EXAMPLES [COUNT]   training passes holding several sequences against one a pass: differences, time
+    \\  q27-glue                  the 27B's glue kernels against their host references (1, 3, 17, 64 rows)
+    \\  q27-cubin DIR             the same kernels against a captured Triton set, mismatch counts printed
     \\
 ;
 
@@ -68,6 +72,7 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("{s}", .{usage});
         return 2;
     }
+    if (std.mem.eql(u8, args[1], "q27-glue") or std.mem.eql(u8, args[1], "q27-cubin")) return q27Main(init, args);
     var driver = try cuda.Driver.open();
     defer driver.close();
     var ctx = try cuda.Context.init(&driver, 0);
@@ -130,8 +135,32 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
         return carveout_tests.run(gpu, if (rest.len > 1) rest[1] else cuda.carveout.default_card, mib);
     }
     if (std.mem.eql(u8, cmd, "train-pack")) return train_pack.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) try std.fmt.parseInt(usize, rest[2], 10) else 24);
+    if (std.mem.eql(u8, cmd, "q27-glue")) return q27_glue_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "q27-cubin")) return q27_cubin_tests.run(gpu, try arg(rest, 0));
     std.debug.print("{s}", .{usage});
     return error.UnknownCommand;
+}
+
+fn q27Main(init: std.process.Init, args: []const [:0]const u8) !u8 {
+    const cmd = args[1];
+    var driver = cuda.Driver.open() catch {
+        std.debug.print("SKIP {s}: no CUDA driver\n", .{cmd});
+        return 0;
+    };
+    defer driver.close();
+    const devices = driver.deviceCount() catch 0;
+    if (devices == 0) {
+        std.debug.print("SKIP {s}: no CUDA device\n", .{cmd});
+        return 0;
+    }
+    var ctx = try cuda.Context.init(&driver, 0);
+    defer ctx.deinit();
+    const gpu: check.Gpu = .{ .d = &driver, .ctx = &ctx, .gpa = init.gpa, .io = init.io };
+    run(gpu, cmd, args[2..]) catch |e| {
+        std.debug.print("FAIL {s}: {t}\n", .{ cmd, e });
+        return 1;
+    };
+    return 0;
 }
 
 fn info(gpu: check.Gpu) !void {

@@ -269,5 +269,14 @@ Gabriele's sm_86 RTX 3090, 24 GiB, commit `6ef33f7c`. These runs were **observed
 
 Cubin output mismatches at rows 1/3/17/64 (ours vs captured Triton, seed `0x27`): everything 0 except `attn_q` 0/0/0/2, `dprep_q` skip/2/2/2, `dprep_k` skip/0/0/2, `tree_p512` 2/4/17/169, `tree_p4096` r64 625, `block_attn` 1/3/2/2.
 
+`6953afde` did not compile on the 3090 (`ours` in `both()` shadowed the pointer parameter). Glue/cubin/mutation/story numbers above and the two `attn_q` r64 DIFFs are from the stale `6ef33f7c` binary, so the FTZ sincos mix was not run. Mapped from those byte offsets (little-endian bf16, even off = low byte, stride `24*256`):
+
+| DIFF | elem | row | head | dim | rotary | freq | pos | note |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| off=345198 ours=93 cubin=92 | 172599 | 28 | 2 | 55 | 1 | 23 | 479 | high half, `x*cs+p*sn` |
+| off=556612 ours=32 cubin=33 | 278306 | 45 | 7 | 34 | 1 | 2 | 268 | high half, `x*cs+p*sn` |
+
+Both are 1-ulp in the bf16 low byte on rotary dims. Host IEEE vs FTZ sincos is 0 on every cubin-test angle, including these two.
+
 GB10, Metal and HIP were not run in this cloud workspace. GPU runtime is Gabriele's 3090 only.
 

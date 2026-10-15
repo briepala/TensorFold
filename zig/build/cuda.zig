@@ -229,6 +229,20 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     cli.addOptions("build_options", build_options);
     cli.addImport("checkpoint_cli", checkpointCli(b, host, .debug, false, native_modules.engines, mods.core));
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli })).step);
+    // Compile tf-cuda-test so q27_cubin_tests.zig is typechecked; zig build test does not install it.
+    const runner = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/main.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    runner.addImport("cuda", cuda);
+    runner.addImport("lanes", mods.lanes);
+    runner.addImport("nemotron", mods.nemotron);
+    runner.addImport("qwen27", mods.qwen27);
+    const exlr8 = exlr8_build.coreAlias(b, host, .debug, mods.core);
+    runner.addImport("exlr8", exlr8);
+    const exlr8_tests = exlr8_build.testModules(b, host, .debug, exlr8);
+    for (exlr8_tests) |m| runner.addImport(m.name, m.module);
+    runner.addImport("exlr8_frozen", b.createModule(.{ .root_source_file = b.path("zig/tests/fixtures/exlr8/frozen.zig"), .target = host, .optimize = .debug }));
+    runner.addImport("exlr8_frozen_dense", b.createModule(.{ .root_source_file = b.path("zig/tests/fixtures/exlr8/frozen_dense.zig"), .target = host, .optimize = .debug }));
+    for (exlr8_build.denseModules(b, host, .debug, exlr8, exlr8_tests[0])) |m| runner.addImport(m.name, m.module);
+    step.dependOn(&b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }).step);
 }
 
 /// nvcc -fatbin with torch's flags, the kernel's own and one -gencode per SASS target, as the Python build passes them.

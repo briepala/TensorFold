@@ -13,6 +13,7 @@ matching Zig model would have to land in the same change as `q27_tree.cu` `tile_
 store. `treeSmem(256)` remains 65792 (two 64-key bf16 tiles plus 64 int flags) in one
 file-scope dynamic buffer `q27_tree_smem`.
 
-Observed on Gabriele's RTX 3090 at commit `6ef33f7c` (cubin vs Triton, not HMMA-rewritten):
+Observed on Gabriele's RTX 3090 at commit `c200b461`, GPU 1 at 350 W (cubin vs Triton, not HMMA-rewritten):
 `tree_p512` mismatches 2/4/17/169 at rows 1/3/17/64; `tree_p4096` row 64 is 625;
-`block_attn` is 1/3/2/2. Those counts are the remaining sequential-dot vs `tl.dot` gap.
+`block_attn` is 1/3/2/2. Attention prep and drafter prep are 0 at those widths.
+Those tree and block counts are the remaining sequential-dot vs `tl.dot` gap.

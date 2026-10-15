@@ -377,7 +377,8 @@ pub fn attnPrep(qg: []const u16, kv: []const u16, qn: []const u16, kn: []const u
                 }
                 bfly32(&w0);
                 bfly32(&w1);
-                inv = mu.invRmsApprox(w0[0] + w1[0], 256, eps);
+                const inv_n: f32 = @bitCast(@as(u32, 0x3b800000));
+                inv = mu.rsqrtApprox(gm.fma(w0[0] + w1[0], inv_n, eps));
             } else {
                 var ss: f32 = 0;
                 for (0..d) |i| ss = gm.fma(bf(src[i]), bf(src[i]), ss);
@@ -394,8 +395,8 @@ pub fn attnPrep(qg: []const u16, kv: []const u16, qn: []const u16, kn: []const u
                     var sn: f32 = 0;
                     var cs: f32 = 0;
                     if (d == 256) {
-                        sn = m.nvSinf(ang);
-                        cs = m.nvCosf(ang);
+                        sn = m.nvSinfFtz(ang);
+                        cs = m.nvCosfFtz(ang);
                     } else m.sincos(ang, &sn, &cs);
                     out = attnRotate(&xn, i, half, cs, sn);
                 }

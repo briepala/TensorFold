@@ -1,4 +1,4 @@
-//! Host copy of q27_math.cuh plus libdevice __nv_sinf/__nv_cosf (CUDA Math API / libdevice.10.bc, PTX cvt.rni.s32.f32).
+//! Host copy of q27_math.cuh: Cody-Waite sincos, IEEE and FTZ libdevice sincos (cvt.rni / cvt.rni.ftz).
 
 const std = @import("std");
 const gm = @import("nemotron").glue_math;
@@ -63,6 +63,22 @@ fn fbits(u: u32) f32 {
     return @bitCast(u);
 }
 
+fn ftz(x: f32) f32 {
+    const u: u32 = @bitCast(x);
+    if ((u & 0x7f800000) == 0 and (u & 0x7fffff) != 0) return @bitCast(u & 0x80000000);
+    return x;
+}
+
+fn fmaFtz(a: f32, b: f32, c: f32) f32 {
+    @setFloatMode(.strict);
+    return ftz(@mulAdd(f32, ftz(a), ftz(b), ftz(c)));
+}
+
+fn mulFtz(a: f32, b: f32) f32 {
+    @setFloatMode(.strict);
+    return ftz(ftz(a) * ftz(b));
+}
+
 /// cvt.rni.s32.f32: round to nearest, ties to even. Zig @round is ties away from zero.
 fn cvtRniS32(x: f32) i32 {
     @setFloatMode(.strict);
@@ -72,41 +88,65 @@ fn cvtRniS32(x: f32) i32 {
     return @intFromFloat((x + magic) - magic);
 }
 
-fn nvPoly(a: f32, for_cos: bool) f32 {
+fn nvPoly(a: f32, for_cos: bool, comptime use_ftz: bool) f32 {
     @setFloatMode(.strict);
-    if (@abs(a) >= 1.056150e5) {
+    if (@abs(a) >= fbits(0x47ce4780)) {
         var sn: f32 = 0;
         var cs: f32 = 0;
         sincos(a, &sn, &cs);
         return if (for_cos) cs else sn;
     }
-    const j = cvtRniS32(a * fbits(0x3f22f983));
+    const t = a * fbits(0x3f22f983);
+    const j = cvtRniS32(if (use_ftz) ftz(t) else t);
     const jf: f32 = @floatFromInt(j);
-    var f = gm.fma(jf, fbits(0xbfc90fda), a);
-    f = gm.fma(jf, fbits(0xb3a22168), f);
-    f = gm.fma(jf, fbits(0xa7c234c5), f);
+    const fm = if (use_ftz) fmaFtz else gm.fma;
+    var f = fm(jf, fbits(0xbfc90fda), a);
+    f = fm(jf, fbits(0xb3a22168), f);
+    f = fm(jf, fbits(0xa7c234c5), f);
     const q = if (for_cos) j + 1 else j;
-    const s = f * f;
+    const s = if (use_ftz) mulFtz(f, f) else f * f;
     const odd = q & 1 != 0;
     const b: f32 = if (odd) 1.0 else f;
-    const sb = gm.fma(s, b, 0);
-    var p: f32 = if (odd) gm.fma(fbits(0x37cbac00), s, fbits(0xbab607ed)) else fbits(0xb94d4153);
-    p = gm.fma(p, s, if (odd) fbits(0x3d2aaabb) else fbits(0x3c0885e4));
-    p = gm.fma(p, s, if (odd) fbits(0xbeffffff) else fbits(0xbe2aaaa8));
-    var r = gm.fma(p, sb, b);
-    if (q & 2 != 0) r = gm.fma(r, -1.0, 0);
+    const sb = fm(s, b, 0);
+    var p: f32 = if (odd) fm(fbits(0x37cbac00), s, fbits(0xbab607ed)) else fbits(0xb94d4153);
+    p = fm(p, s, if (odd) fbits(0x3d2aaabb) else fbits(0x3c0885e4));
+    p = fm(p, s, if (odd) fbits(0xbeffffff) else fbits(0xbe2aaaa8));
+    var r = fm(p, sb, b);
+    if (q & 2 != 0) r = fm(r, -1.0, 0);
     return r;
 }
 
 pub fn nvSinf(a: f32) f32 {
-    return nvPoly(a, false);
+    return nvPoly(a, false, false);
 }
 
 pub fn nvCosf(a: f32) f32 {
-    return nvPoly(a, true);
+    return nvPoly(a, true, false);
+}
+
+pub fn nvSinfFtz(a: f32) f32 {
+    return nvPoly(a, false, true);
+}
+
+pub fn nvCosfFtz(a: f32) f32 {
+    return nvPoly(a, true, true);
 }
 
 test "libdevice fast-path sin and cos at 0" {
     try std.testing.expectEqual(@as(f32, 0), nvSinf(0));
     try std.testing.expectEqual(@as(f32, 1), nvCosf(0));
+}
+
+test "FTZ sincos matches IEEE on cubin-test angles" {
+    var mis: usize = 0;
+    for (0..64) |row| {
+        const pr: i32 = @intCast((row * 17 + 3) % 500);
+        const pf: f32 = @floatFromInt(pr);
+        for (0..32) |i| {
+            const inv: f32 = @floatCast(std.math.pow(f64, 1e7, -@as(f64, @floatFromInt(i)) / 32.0));
+            const ang = pf * inv;
+            if (nvSinf(ang) != nvSinfFtz(ang) or nvCosf(ang) != nvCosfFtz(ang)) mis += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), mis);
 }

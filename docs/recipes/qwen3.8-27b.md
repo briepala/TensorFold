@@ -245,12 +245,29 @@ Facts that still hold for the EXL3 27B CUDA path on sm_86:
 
 - Prompt rows use `exl3Dense` (the EXL3 prompt GEMM), not a Triton `_gemm` cubin.
 - Glue is four required fatbins beside the image array: `q27_rows`, `q27_prep`, `q27_tree`, and `q27_draft.cu`.
-- Tree and block attention still use sequential fp32 dots (`__fmaf_rn`) rather than Triton's `tl.dot` / `HMMA.16816.F32.BF16` ([HMMA notes](../q27-sm86-hmma.md)).
-- Attention prep at head dim 256 calls libdevice `__nv_sinf` / `__nv_cosf` (CUDA Math API); other widths keep Cody-Waite `tf_q27m::sincos`. The captured `_attn_prep` inlines that polynomial with `FFMA.FTZ` / `F2I.FTZ.NTZ`; the published fatbin stays `--ftz=false` (IEEE `FFMA` / `F2I.NTZ`) until a GPU sincos probe says otherwise.
+- Tree and block attention still use sequential fp32 dots (`__fmaf_rn`) rather than Triton's `tl.dot` / `HMMA.16816.F32.BF16` ([HMMA notes](../q27-sm86-hmma.md)). Ampere MMA has no documented f32 add tree a Zig host `fma` loop can replay, so `q27-glue` keeps sequential dots.
+- Attention prep at head dim 256 inlines Triton's sincos mix: IEEE mul by 2/π, `cvt.rni.ftz.s32.f32`, then `FFMA.FTZ` / `FMUL.FTZ` (`tf_q27m::nv_sincos`). `|a| >= 105615` still calls libdevice `__nv_sinf` / `__nv_cosf`. Other widths keep Cody-Waite `tf_q27m::sincos`. RMS at d=256 uses exact `0x3b800000` (1/256).
 - Tree attention's warp tile extends to head dim 256 with keys and values in one file-scope dynamic shared buffer (`q27_tree_smem`, `treeSmem(256)=65792`).
 - Width-5120 add-RMSNorm is a 256-thread reduction plus MUFU `sqrt.approx` then `rcp.approx`.
 - Host `ex2.approx` keeps the captured tie and flush rules in `mufu_ref.zig` (do not change those tables).
 - Standalone group-sums is the 8-lane balanced tree launched by the drafter and the head.
 - Drafter prep (`dprep`) is a 32-lane pair butterfly with per-lane `rsqrt.approx` and contracted rotate `fmaf(a, cos, -(b * sin))` (Triton `FFMA a, cos, -prod`). The `fmaf(-b, sin, a * cos)` try did not match that SASS.
 - GDN prep at `dk==128` is a 64-thread pair reduction.
+
+## RTX 3090 receipt (observed)
+
+Gabriele's sm_86 RTX 3090, 24 GiB, commit `6ef33f7c`. These runs were **observed at 225 W** (a temporary testing cap). **350 W is the target config** when the system is complete. Scripts never set power limits (`nvidia-smi -pl` is not used); they only query `power.limit`.
+
+| check | result |
+|---|---|
+| Power | observed 225 W (temporary); target 350 W; scripts never set `-pl` |
+| `SINPOLY n=2051` | `ieee_sin=0 ieee_cos=0 ftz_sin=0 ftz_cos=0`, `SINPOLY_EXIT:0` |
+| `BUILD_EXIT` / `GLUE_EXIT` / `CUBIN_EXIT` | 0 / 0 / 0 |
+| `MUT_GLUE_EXIT` / `PASS_GLUE_EXIT` | 1 / 0 |
+| Skip (`CUDA_VISIBLE_DEVICES` empty) | `error: cuInit: CUDA_ERROR_NO_DEVICE (100)` and `SKIP q27-glue: no CUDA driver`, `SKIP_EXIT:0` |
+| Story | prompt 29, 128 tokens, sha `ad4cdd989e83`, 12.70 s, weights 11.81 GiB, `STORY_EXIT:0` |
+
+Cubin output mismatches at rows 1/3/17/64 (ours vs captured Triton, seed `0x27`): everything 0 except `attn_q` 0/0/0/2, `dprep_q` skip/2/2/2, `dprep_k` skip/0/0/2, `tree_p512` 2/4/17/169, `tree_p4096` r64 625, `block_attn` 1/3/2/2.
+
+GB10, Metal and HIP were not run in this cloud workspace. GPU runtime is Gabriele's 3090 only.
 

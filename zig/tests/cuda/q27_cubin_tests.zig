@@ -87,13 +87,31 @@ const Rig = struct {
         for (a, b, 0..) |x, y, i| {
             if (x != y) {
                 mis += 1;
-                if (shown < 6) {
+                if (shown < 8) {
                     std.debug.print("DIFF {s} rows={d} off={d} ours={x:0>2} cubin={x:0>2}\n", .{ name, rows, i, x, y });
                     shown += 1;
                 }
             }
         }
         if (mis != 0 and std.mem.startsWith(u8, name, "add_rmsnorm")) r.bad += 1;
+        if (mis != 0 and (std.mem.eql(u8, name, "attn_q") or std.mem.eql(u8, name, "attn_k"))) {
+            const heads: usize = if (std.mem.eql(u8, name, "attn_q")) QH else KV;
+            const stride = heads * HD;
+            var shown_e: usize = 0;
+            var e: usize = 0;
+            while (e < n / 2) : (e += 1) {
+                const ours: u16 = @as(u16, a[e * 2]) | (@as(u16, a[e * 2 + 1]) << 8);
+                const cub: u16 = @as(u16, b[e * 2]) | (@as(u16, b[e * 2 + 1]) << 8);
+                if (ours == cub) continue;
+                const row = e / stride;
+                const rest = e % stride;
+                const head = rest / HD;
+                const dim = rest % HD;
+                std.debug.print("ELEM {s} rows={d} elem={d} row={d} head={d} dim={d} rotary={d} ours={x:0>4} cubin={x:0>4}\n", .{ name, rows, e, row, head, dim, @intFromBool(dim < 2 * Half), ours, cub });
+                shown_e += 1;
+                if (shown_e >= 8) break;
+            }
+        }
         std.debug.print("CUBIN {s} rows={d} mismatches={d}\n", .{ name, rows, mis });
     }
 };

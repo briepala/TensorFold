@@ -82,6 +82,48 @@ __device__ __forceinline__ float fma_ftz(float a, float b, float c) {
     return r;
 }
 
+__device__ __forceinline__ float mul_ftz(float a, float b) {
+    float r;
+    asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
+
+extern "C" __device__ float __nv_sinf(float);
+extern "C" __device__ float __nv_cosf(float);
+
+__device__ __forceinline__ float nv_poly_q(float f, int q) {
+    const float s = mul_ftz(f, f);
+    const int odd = q & 1;
+    const float b = odd ? 1.f : f;
+    const float sb = fma_ftz(s, b, 0.f);
+    float p = odd ? fma_ftz(__uint_as_float(0x37cbac00u), s, __uint_as_float(0xbab607edu)) : __uint_as_float(0xb94d4153u);
+    p = fma_ftz(p, s, odd ? __uint_as_float(0x3d2aaabbu) : __uint_as_float(0x3c0885e4u));
+    p = fma_ftz(p, s, odd ? __uint_as_float(0xbeffffffu) : __uint_as_float(0xbe2aaaa8u));
+    float r = fma_ftz(p, sb, b);
+    if (q & 2) r = fma_ftz(r, -1.f, 0.f);
+    return r;
+}
+
+// Captured _attn_prep: IEEE mul by 2/pi, cvt.rni.ftz.s32.f32, then FFMA.FTZ / FMUL.FTZ. |a|>=105615 uses libdevice.
+__device__ __forceinline__ void nv_sincos(float a, float& sn, float& cs) {
+    float ax;
+    asm("abs.ftz.f32 %0, %1;" : "=f"(ax) : "f"(a));
+    if (ax >= 105615.f) {
+        sn = __nv_sinf(a);
+        cs = __nv_cosf(a);
+        return;
+    }
+    const float t = __fmul_rn(a, __uint_as_float(0x3f22f983u));
+    int j;
+    asm("cvt.rni.ftz.s32.f32 %0, %1;" : "=r"(j) : "f"(t));
+    const float jf = static_cast<float>(j);
+    float f = fma_ftz(jf, __uint_as_float(0xbfc90fdau), a);
+    f = fma_ftz(jf, __uint_as_float(0xb3a22168u), f);
+    f = fma_ftz(jf, __uint_as_float(0xa7c234c5u), f);
+    sn = nv_poly_q(f, j);
+    cs = nv_poly_q(f, j + 1);
+}
+
 // tl.log, the captured integer reduction and the FTZ polynomial on the mantissa.
 __device__ __forceinline__ float mufu_log(float x) {
     const unsigned xi = __float_as_uint(x);

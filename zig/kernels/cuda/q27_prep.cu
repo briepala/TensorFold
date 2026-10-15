@@ -8,9 +8,6 @@
 
 using bf16 = __nv_bfloat16;
 
-extern "C" __device__ float __nv_sinf(float);
-extern "C" __device__ float __nv_cosf(float);
-
 __device__ float ab_f32(const void* p, int i, int f16) {
     if (f16) return __half2float(reinterpret_cast<const __half*>(p)[i]);
     return tf_glue::bf(reinterpret_cast<const bf16*>(p)[i]);
@@ -122,7 +119,8 @@ extern "C" __global__ void tf_q27_attn_prep(const bf16* __restrict__ qg, const b
         const float part = tf_q27m::bfly32(__fadd_rn(p0, p1));
         if ((tid & 31) == 0) ws[tid >> 5] = part;
         __syncthreads();
-        const float inv = tf_q27m::mufu_inv_rms(__fadd_rn(ws[0], ws[1]), 256, eps);
+        const float z = __fmaf_rn(__fadd_rn(ws[0], ws[1]), __uint_as_float(0x3b800000u), eps);
+        const float inv = tf_q27m::mufu_rcp(tf_q27m::mufu_sqrt(z));
         float xn[4];
         for (int k = 0; k < 4; ++k) xn[k] = tf_glue::rbf(__fmul_rn(__fmul_rn(tf_glue::bf(src[i0 + k]), inv), tf_glue::bf(norm[i0 + k])));
         for (int k = 0; k < 4; ++k) {
@@ -134,7 +132,9 @@ extern "C" __global__ void tf_q27_attn_prep(const bf16* __restrict__ qg, const b
                 const float ang = __fmul_rn(static_cast<float>(pr), invf[freq]);
                 const int pi = i < half ? i + half : i - half;
                 const float pn = tf_glue::rbf(__fmul_rn(__fmul_rn(tf_glue::bf(src[pi]), inv), tf_glue::bf(norm[pi])));
-                out = attn_rotate(xn[k], pn, __nv_cosf(ang), __nv_sinf(ang), i < half);
+                float sn, cs;
+                tf_q27m::nv_sincos(ang, sn, cs);
+                out = attn_rotate(xn[k], pn, cs, sn, i < half);
             }
             dst[i] = __float2bfloat16_rn(tf_glue::rbf(out));
         }

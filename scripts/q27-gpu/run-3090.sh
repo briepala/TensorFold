@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RTX 3090 receipt: glue, cubin vs captured Triton, add_rms mutation, skip, story. No --kernels.
+# RTX 3090 receipt. Never nvidia-smi -pl. Target 350 W; 225 W is the temporary test cap.
 set -u
 ROOT="${Q27_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
 cd "$ROOT"
@@ -19,6 +19,7 @@ run() { echo "$1"; eval "$1"; echo "${2:-STATUS}:$?"; }
 {
   echo "START $(date -Is)"
   echo "COMMIT $(git rev-parse HEAD)"
+  echo "POWER_TARGET:350 W"
   nvidia-smi --query-gpu=index,name,memory.total,power.limit --format=csv,noheader
   echo "KERNELS_UNSET:${TENSORFOLD_CUDA_KERNELS-}"
   run '"$ZIG" build -Doptimize=ReleaseFast -Dnvcc=nvcc -Dsm=86 -Dstrip=true' BUILD_EXIT
@@ -58,4 +59,5 @@ echo "SKIP_LOG:${LOG%.log}-skip.log" >>"$LOG"
 
 echo "Wrote $LOG and ${LOG%.log}-skip.log"
 echo "Paste BUILD_EXIT, GLUE_EXIT, every CUBIN <kernel> rows=<n> mismatches=<m> line, CUBIN_EXIT,"
-echo "MUT_GLUE_EXIT (must be nonzero), PASS_GLUE_EXIT, the skip log, STORY_EXIT, and the story token sha."
+echo "every ELEM attn_q / DIFF attn_q line, MUT_GLUE_EXIT (must be nonzero), PASS_GLUE_EXIT,"
+echo "the skip log, STORY_EXIT, the story token sha, and the nvidia-smi power.limit line."

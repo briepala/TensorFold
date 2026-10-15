@@ -246,12 +246,12 @@ Facts that still hold for the EXL3 27B CUDA path on sm_86:
 - Prompt rows use `exl3Dense` (the EXL3 prompt GEMM), not a Triton `_gemm` cubin.
 - Glue is four required fatbins beside the image array: `q27_rows`, `q27_prep`, `q27_tree`, and `q27_draft.cu`.
 - Tree and block attention still use sequential fp32 dots (`__fmaf_rn`) rather than Triton's `tl.dot` / `HMMA.16816.F32.BF16` ([HMMA notes](../q27-sm86-hmma.md)). Ampere MMA has no documented f32 add tree a Zig host `fma` loop can replay, so `q27-glue` keeps sequential dots.
-- Attention prep at head dim 256 inlines Triton's sincos mix: IEEE mul by 2/π, `cvt.rni.ftz.s32.f32`, then `FFMA.FTZ` / `FMUL.FTZ` (`tf_q27m::nv_sincos`). `|a| >= 105615` still calls libdevice `__nv_sinf` / `__nv_cosf`. Other widths keep Cody-Waite `tf_q27m::sincos`. RMS at d=256 uses exact `0x3b800000` (1/256).
+- Attention prep at head dim 256 inlines Triton's sincos mix: IEEE mul by 2/π, `cvt.rni.ftz.s32.f32`, then `FFMA.FTZ` / `FMUL.FTZ` (`tf_q27m::nv_sincos`). `|a| >= 105615` still calls libdevice `__nv_sinf` / `__nv_cosf`. Other widths keep Cody-Waite `tf_q27m::sincos`. RMS at d=256 uses exact `0x3b800000` (1/256). Rotate is `fmaf(x, cos, ±(p * sin))`, the captured `FFMA`.
 - Tree attention's warp tile extends to head dim 256 with keys and values in one file-scope dynamic shared buffer (`q27_tree_smem`, `treeSmem(256)=65792`).
 - Width-5120 add-RMSNorm is a 256-thread reduction plus MUFU `sqrt.approx` then `rcp.approx`.
 - Host `ex2.approx` keeps the captured tie and flush rules in `mufu_ref.zig` (do not change those tables).
 - Standalone group-sums is the 8-lane balanced tree launched by the drafter and the head.
-- Drafter prep (`dprep`) is a 32-lane pair butterfly with per-lane `rsqrt.approx` and contracted rotate `fmaf(a, cos, -(b * sin))` (Triton `FFMA a, cos, -prod`). The `fmaf(-b, sin, a * cos)` try did not match that SASS.
+- Drafter prep (`dprep`) is a 32-lane pair butterfly with per-lane `rsqrt.approx`. Low half is `fmaf(a, cos, -(b * sin))`. High half is `fmaf(sin, a, b * cos)`. `fmaf(b, cos, a * sin)` and `fmaf(-b, sin, a * cos)` each missed the captured `FFMA` by 1 ulp.
 - GDN prep at `dk==128` is a 64-thread pair reduction.
 
 ## RTX 3090 receipt (observed)

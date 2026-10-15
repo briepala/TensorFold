@@ -347,7 +347,8 @@ fn attnAxis(freq: usize, mrope_rows: usize, hsec: usize, wsec: usize) usize {
 fn attnRotate(xn: []const f32, i: usize, half: usize, cs: f32, sn: f32) f32 {
     @setFloatMode(.strict);
     const pn = xn[if (i < half) i + half else i - half];
-    return if (i < half) (xn[i] * cs) - (pn * sn) else (xn[i] * cs) + (pn * sn);
+    const prod = pn * sn;
+    return if (i < half) gm.fma(xn[i], cs, -prod) else gm.fma(xn[i], cs, prod);
 }
 
 pub fn attnPrep(qg: []const u16, kv: []const u16, qn: []const u16, kn: []const u16, pos: []const i32, invf: []const f32, qo: []u16, ko: []u16, rows: usize, h: usize, hkv: usize, d: usize, half: usize, eps: f32, mrope_rows: usize, hsec: usize, wsec: usize) void {

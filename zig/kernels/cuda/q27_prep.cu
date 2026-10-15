@@ -92,8 +92,10 @@ __device__ int attn_axis(int freq, int mrope_rows, int hsec, int wsec) {
     return 0;
 }
 
+// Captured _attn_prep: FFMA x, cos, ±(p*sin), then F2FP.BF16. The separate mul and add misses 1 ulp.
 __device__ float attn_rotate(float x, float p, float cs, float sn, int lo) {
-    return lo ? __fsub_rn(__fmul_rn(x, cs), __fmul_rn(p, sn)) : __fadd_rn(__fmul_rn(x, cs), __fmul_rn(p, sn));
+    const float prod = __fmul_rn(p, sn);
+    return lo ? __fmaf_rn(x, cs, -prod) : __fmaf_rn(x, cs, prod);
 }
 
 // RMS then rotate-half. pos is int32. mrope_rows > 0 reads three coordinates at axis * mrope_rows + row.

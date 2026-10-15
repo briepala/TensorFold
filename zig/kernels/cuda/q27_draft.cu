@@ -38,7 +38,8 @@ __device__ void dprep_pair(const bf16* src, const bf16* norm, const float* cos, 
     const float cs = cos[(size_t)row * half + i];
     const float sn = sin[(size_t)row * half + i];
     dst[i] = __float2bfloat16_rn(__fmaf_rn(a, cs, -__fmul_rn(b, sn)));
-    dst[half + i] = __float2bfloat16_rn(__fmaf_rn(b, cs, __fmul_rn(a, sn)));
+    // High half matches captured FFMA sin, a, b*cos. fmaf(b, cos, a*sin) is 1 ulp off.
+    dst[half + i] = __float2bfloat16_rn(__fmaf_rn(sn, a, __fmul_rn(b, cs)));
 }
 
 // Norm and rotate q/k from cos and sin. V is a copy. half 64: lane L owns one pair in each half and its own rsqrt.

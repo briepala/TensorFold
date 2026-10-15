@@ -112,6 +112,22 @@ const Rig = struct {
                 if (shown_e >= 8) break;
             }
         }
+        if (mis != 0 and (std.mem.eql(u8, name, "dprep_q") or std.mem.eql(u8, name, "dprep_k"))) {
+            var shown_e: usize = 0;
+            var e: usize = 0;
+            while (e < n / 2) : (e += 1) {
+                const got: u16 = @as(u16, a[e * 2]) | (@as(u16, a[e * 2 + 1]) << 8);
+                const cub: u16 = @as(u16, b[e * 2]) | (@as(u16, b[e * 2 + 1]) << 8);
+                if (got == cub) continue;
+                const slot = e / DD;
+                const dim = e % DD;
+                const head = slot / rows;
+                const row = slot % rows;
+                std.debug.print("ELEM {s} rows={d} elem={d} row={d} head={d} dim={d} high={d} ours={x:0>4} cubin={x:0>4}\n", .{ name, rows, e, row, head, dim, @intFromBool(dim >= DD / 2), got, cub });
+                shown_e += 1;
+                if (shown_e >= 8) break;
+            }
+        }
         std.debug.print("CUBIN {s} rows={d} mismatches={d}\n", .{ name, rows, mis });
     }
 };

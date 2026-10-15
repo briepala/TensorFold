@@ -47,7 +47,7 @@ fn dprepPair(src: []const u16, norm: []const u16, cos: []const f32, sin: []const
     const cs = cos[row * half + i];
     const sn = sin[row * half + i];
     dst[i] = store(gm.fma(a, cs, -(b * sn)));
-    dst[half + i] = store(gm.fma(b, cs, a * sn));
+    dst[half + i] = store(gm.fma(sn, a, b * cs));
 }
 
 pub fn dprep(qkv: []const u16, qn: []const u16, kn: []const u16, cos: []const f32, sin: []const f32, qo: []u16, ko: []u16, vo: []u16, rows: usize, h: usize, hkv: usize, half: usize, stride: usize, eps: f32) void {
